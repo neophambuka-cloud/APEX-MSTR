@@ -1,0 +1,2253 @@
+#!/usr/bin/env python3
+"""
+APEX V11.5 - CANONICAL
+
+Lineage: V11.1 (V10.1's 16 fixes + V10.2's 2 + pristine requirements),
+         plus V11.4's daily-report and audit, plus V11.3's two critical
+         fixes. No Parse.bot, no Saylor overlay. One file.
+
+Signal fix (from V11.3): FeeMomentumSignal.decide multiplies us_move_pct
+    by 100 to convert fraction -> percentage points before comparing to
+    gate_pct. Without this the signal could never fire. This bug was
+    present in V11.1, V11.2, V11.4, and every earlier version.
+
+Spread fix (from V11.3): build_snapshot no longer marks the leg
+    tradeable=False on wide spread. Instead it records spread_reason and
+    plan_trade checks it per action: BUY against MAX_SPREAD_PCT, SELL
+    against MAX_EXIT_SPREAD_PCT. Previously the wide entry ceiling made
+    the wider exit ceiling dead code.
+
+Fixes carried from V11.1 / V11.4:
+  R1 LIVE: Yahoo fallback is not tradeable. quote() raises.
+  R2 PAPER: Yahoo fallback + synthetic book, so forward log trades.
+  R3 Per-pair cost basis. Partial sells reduce proportionally.
+  R4 Session close retries until leg is flat.
+  F3 build_signal raises on unknown; no silent smacross fallback.
+  F5 Partial-fill SELL reduces entry fee/base proportionally.
+  F6 _paper_mid_cache cleared at top of each cycle.
+  F7 Telegram 401 warns once per process.
+  F8 liquidate_all zeroes ghost_cost_deployed on clean sweep.
+  F9 Signal dispatch by type in run_cycle.
+  F10 HALT blocks entries only; exits and session close still run.
+
+Ghost Laws:
+  1. No BTC buy. ALLOWED_SUBSTRINGS = MSTR, STRC. BTC/XBT dropped.
+  2. Fee-aware gate. Below gate -> DO NOTHING.
+  3. Real-world verification via apex_receipts.jsonl + mark-withdrawn.
+  4. Production before expansion. GHOST_ALLOCATION_ZAR is the lever.
+  5. Hard cap on deployment. No margin.
+"""
+
+# --------------------------------------------------------------- imports ---
+import argparse
+import json
+import logging
+import math
+import os
+import statistics
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+
+import requests
+
+# ------------------------------------------------------ env auto-loader ---
+def _load_env_file(path):
+    try:
+        import pathlib
+        fp = pathlib.Path(path).expanduser()
+        if not fp.exists():
+            return {}
+        loaded = {}
+        for raw in fp.read_text().splitlines():
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("export "):
+                s = s[7:].strip()
+            if "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if not k:
+                continue
+            loaded[k] = v
+            existing = os.environ.get(k, "")
+            if "..." not in v and len(v) > 12:
+                os.environ[k] = v
+            elif not existing or "..." in existing:
+                os.environ[k] = v
+        return loaded
+    except Exception as e:
+        print(f"env load {path} failed: {e}")
+        return {}
+
+
+_load_env_file("~/Set-Env-PRISTINE.sh")
+_load_env_file("./Set-Env-PRISTINE.sh")
+_load_env_file("Set-Env-PRISTINE.sh")
+
+os.environ["MSTR_PAIR"] = "MSTRx_ZAR"
+os.environ["STRC_PAIR"] = "STRCx_ZAR"
+
+_LID = (os.getenv("LUNO_KEY_ID") or os.getenv("LUNO_API_KEY_ID")
+        or os.getenv("LUNO_API_KEY") or os.getenv("LUNO_KEY") or "")
+_LSEC = os.getenv("LUNO_SECRET") or os.getenv("LUNO_API_SECRET") or ""
+_KEYS_BROKEN = (("..." in _LID) or ("..." in _LSEC)
+                or len(_LID) < 15 or len(_LSEC) < 20)
+if _KEYS_BROKEN:
+    if os.getenv("APEX_MODE", "").upper() == "LIVE":
+        print(">>> APEX: LUNO keys truncated -> forcing PAPER. Paste FULL keys "
+              "into ~/Set-Env-PRISTINE.sh for LIVE.")
+    os.environ["APEX_MODE"] = "PAPER"
+
+# ---------------------------------------------------------------- config ---
+def _envf(k, d):
+    try:
+        return float(os.getenv(k, d))
+    except (TypeError, ValueError):
+        return float(d)
+
+
+def _envi(k, d):
+    try:
+        return int(os.getenv(k, d))
+    except (TypeError, ValueError):
+        return int(d)
+
+
+MODE = os.getenv("APEX_MODE", "PAPER").strip().upper()
+PAIR = os.getenv("MSTR_PAIR", "MSTRx_ZAR").strip()
+STRC_PAIR = os.getenv("STRC_PAIR", "STRCx_ZAR").strip()
+
+STATE_FILE = os.getenv("APEX_STATE", "apex_state.json")
+LOG_FILE = os.getenv("APEX_LOG", "apex.log")
+HEARTBEAT_FILE = os.getenv("APEX_HEARTBEAT", "apex_heartbeat.json")
+FILLS_FILE = os.getenv("APEX_FILLS", "apex_fills.jsonl")
+RECEIPTS_FILE = os.getenv("APEX_RECEIPTS", "apex_receipts.jsonl")
+
+HALT_FILE = "HALT"
+LIQUIDATE_FILE = "LIQUIDATE"
+LIQUIDATE_INPROGRESS = "LIQUIDATE.inprogress"
+LIQUIDATE_DONE = "LIQUIDATE.done"
+LIQUIDATE_FAILED = "LIQUIDATE.failed"
+
+GHOST_ALLOCATION_ZAR = _envf("APEX_GHOST_ALLOCATION_ZAR",
+                             _envf("APEX_PAPER_STARTING_ZAR", 100.0))
+GHOST_MAX_TRADE_ZAR = _envf("APEX_GHOST_MAX_TRADE_ZAR", 100.0)
+PAPER_STARTING_ZAR = _envf("APEX_PAPER_STARTING_ZAR", GHOST_ALLOCATION_ZAR)
+
+MIN_TRADE_ZAR = _envf("APEX_MIN_TRADE_ZAR", 10.0)
+LOOP_SECONDS = _envi("APEX_LOOP_SECONDS", 14400)
+HEARTBEAT_HOURS = _envf("APEX_HEARTBEAT_HOURS", 12.0)
+MAX_PRICE_JUMP = _envf("APEX_MAX_PRICE_JUMP", 0.35)
+ALERT_AFTER_ERRORS = _envi("APEX_ALERT_AFTER_ERRORS", 3)
+CANCEL_OPEN = os.getenv("APEX_CANCEL_OPEN", "0") == "1"
+
+MAX_TICKER_AGE_S = _envf("APEX_MAX_TICKER_AGE_S", 900.0)
+MAX_SPREAD_PCT = _envf("APEX_MAX_SPREAD_PCT", 2.0)
+MAX_EXIT_SPREAD_PCT = _envf("APEX_MAX_EXIT_SPREAD_PCT", MAX_SPREAD_PCT * 2.0)
+MAX_IMPACT_PCT = _envf("APEX_MAX_IMPACT_PCT", 0.50)
+MAX_DRAWDOWN_PCT = _envf("APEX_MAX_DRAWDOWN_PCT", 0.0) / 100.0
+COOLDOWN_S = _envf("APEX_COOLDOWN_SECONDS", 1800.0)
+LIQ_IMPACT_MULT = _envf("APEX_LIQ_IMPACT_MULT", 2.0)
+STOP_PCT = _envf("APEX_STOP_PCT", 0.0) / 100.0
+
+PAPER_FEE_PCT = _envf("APEX_PAPER_FEE_PCT", 0.75)
+FEE_BREAKEVEN_FLOOR_PCT = _envf("APEX_FEE_BREAKEVEN_PCT", 0.70)
+MAX_NOTIFY_KEYS = _envi("APEX_MAX_NOTIFY_KEYS", 512)
+
+SESSION_START = os.getenv("APEX_SESSION_START_SAST", "15:30")
+SESSION_END = os.getenv("APEX_SESSION_END_SAST", "22:00")
+SESSION_ENFORCE = os.getenv("APEX_SESSION_ENFORCE", "1") == "1"
+
+ALLOWED_SUBSTRINGS = ("MSTR", "STRC")
+BTC_BLOCKED = ("BTC", "XBT")
+
+SIGNAL_NAME = os.getenv("APEX_SIGNAL", "fee_momentum").strip().lower()
+BETA_MSTR = _envf("APEX_BETA_MSTR", 1.7)
+BETA_STRC = _envf("APEX_BETA_STRC", 0.3)
+PARK_IN_STRC = os.getenv("APEX_PARK_IN_STRC", "0") == "1"
+
+CANDLE_SECONDS = _envi("APEX_CANDLE_SECONDS", 3600)
+FAST_N = _envi("APEX_FAST", 5)
+SLOW_N = _envi("APEX_SLOW", 20)
+EDGE_K = _envf("APEX_EDGE_K", 10.0)
+
+LUNO_KEY = (os.getenv("LUNO_KEY_ID") or os.getenv("LUNO_API_KEY_ID")
+            or os.getenv("LUNO_API_KEY") or os.getenv("LUNO_KEY") or "").strip()
+LUNO_SECRET = (os.getenv("LUNO_SECRET") or os.getenv("LUNO_API_SECRET")
+               or "").strip()
+TG_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TG_TOKEN")
+            or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TG_CHAT = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
+           or "").strip()
+
+# --------------------------------------------------------------- logging ---
+_logger = logging.getLogger("apex")
+_logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s",
+                         "%Y-%m-%d %H:%M:%S")
+try:
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3)
+    _fh.setFormatter(_fmt)
+    _logger.addHandler(_fh)
+except OSError:
+    pass
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+_logger.addHandler(_sh)
+
+
+def log(msg, level=logging.INFO):
+    _logger.log(level, msg)
+
+
+class ApexError(Exception):
+    pass
+
+
+class DataUnavailable(ApexError):
+    pass
+
+
+@contextmanager
+def _flock(path):
+    f = None
+    try:
+        f = open(path + ".lock", "w")
+        try:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except Exception:
+            pass
+        yield
+    finally:
+        if f is not None:
+            try:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def _proxies():
+    try:
+        if hasattr(os, "uname") and "pythonanywhere" in os.uname().nodename.lower():
+            return {"http": "http://proxy.server:3128",
+                    "https": "http://proxy.server:3128"}
+    except Exception:
+        pass
+    return None
+
+
+PROXIES = _proxies()
+
+_HARD_FALLBACK_USD = {"MSTRx": 151.84, "STRCx": 98.77}
+_HARD_FALLBACK_FX = 16.25
+_YAHOO_TICKER = {"MSTRx": "MSTR", "STRCx": "STRC"}
+
+
+def _yahoo_get(symbol, interval, rng, timeout=8):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": interval, "range": rng}
+    headers = {"User-Agent": "Mozilla/5.0 (APEX/11.5)"}
+    last_err = None
+    for proxies in ([PROXIES, None] if PROXIES else [None]):
+        try:
+            r = requests.get(url, params=params, headers=headers,
+                             timeout=timeout, proxies=proxies)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"yahoo {symbol} failed: {last_err}")
+
+
+def _yahoo_last_price(symbol):
+    j = _yahoo_get(symbol, "1m", "1d")
+    meta = j["chart"]["result"][0]["meta"]
+    return float(meta["regularMarketPrice"])
+
+
+def _yahoo_momentum(symbol):
+    j = _yahoo_get(symbol, "5m", "1d")
+    meta = j["chart"]["result"][0]["meta"]
+    curr = float(meta.get("regularMarketPrice") or 0)
+    prev = float(meta.get("chartPreviousClose")
+                 or meta.get("previousClose") or 0)
+    if curr <= 0 or prev <= 0:
+        raise RuntimeError(f"yahoo {symbol} momentum: bad meta")
+    return (curr - prev) / prev
+
+
+def _get_live_price_fallback(pair):
+    base = pair.split("_")[0]
+    sym = _YAHOO_TICKER.get(base, base)
+    try:
+        usd = _yahoo_last_price(sym)
+    except Exception as e:
+        log(f"yahoo {sym} failed ({e}); hard fallback "
+            f"{_HARD_FALLBACK_USD.get(base)}", logging.WARNING)
+        usd = _HARD_FALLBACK_USD.get(base)
+    try:
+        fx = _yahoo_last_price("ZAR=X")
+    except Exception:
+        try:
+            fx = _yahoo_last_price("USDZAR=X")
+        except Exception:
+            fx = None
+    if fx is None or fx <= 0:
+        fx = _HARD_FALLBACK_FX
+    if usd is None or usd <= 0:
+        raise RuntimeError(f"no price available for {pair}")
+    return usd, usd * fx, fx
+
+
+def _get_fallback_candles(pair, count=22):
+    try:
+        _, zar, _ = _get_live_price_fallback(pair)
+    except Exception as e:
+        raise DataUnavailable(f"fallback candles {pair}: {e}") from e
+    now = time.time()
+    out = []
+    for i in range(count):
+        t = (now - (count - 1 - i) * CANDLE_SECONDS) * 1000.0
+        out.append({"timestamp": t, "open": zar * 0.999, "high": zar * 1.002,
+                    "low": zar * 0.998, "close": zar, "volume": 1000.0})
+    return out
+
+
+_last_sent = {}
+_tg_401_warned = False
+
+
+def _prune_notify_cache(now):
+    if len(_last_sent) <= MAX_NOTIFY_KEYS:
+        return
+    cutoff = now - 86400
+    for k in [k for k, t in _last_sent.items() if t < cutoff]:
+        _last_sent.pop(k, None)
+
+
+def notify(msg, key=None, min_gap_seconds=0):
+    global _tg_401_warned
+    now = time.time()
+    if key and min_gap_seconds:
+        if now - _last_sent.get(key, 0) < min_gap_seconds:
+            return False
+        _last_sent[key] = now
+        _prune_notify_cache(now)
+    if not TG_TOKEN or not TG_CHAT:
+        log(f"[no telegram] {msg}")
+        return False
+    if "..." in TG_TOKEN or len(TG_TOKEN) < 20:
+        log(f"[telegram token invalid] {msg}")
+        return False
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT, "text": msg}
+    for proxies in ([PROXIES, None] if PROXIES else [None]):
+        try:
+            r = requests.post(url, json=payload, timeout=15, proxies=proxies)
+            if r.status_code == 200:
+                return True
+            if r.status_code == 401:
+                if not _tg_401_warned:
+                    log(">>> APEX: Telegram 401 - token revoked. Update "
+                        "TG_TOKEN. Further 401s suppressed this process.",
+                        logging.WARNING)
+                    _tg_401_warned = True
+                return False
+            if r.status_code == 429:
+                return False
+            log(f"telegram {r.status_code}: {r.text[:200]}", logging.WARNING)
+        except requests.RequestException as e:
+            log(f"telegram transport error: {e}", logging.WARNING)
+    return False
+
+
+def _parse_hhmm(s):
+    h, m = s.split(":")
+    return int(h), int(m)
+
+
+def sast_now(now_utc=None):
+    now_utc = now_utc if now_utc is not None else time.time()
+    sast_seconds = now_utc + 2 * 3600
+    h = int((sast_seconds // 3600) % 24)
+    m = int((sast_seconds // 60) % 60)
+    return h, m
+
+
+def in_session(now_utc=None):
+    if not SESSION_ENFORCE:
+        return True
+    h, m = sast_now(now_utc)
+    now_min = h * 60 + m
+    sh, sm = _parse_hhmm(SESSION_START)
+    eh, em = _parse_hhmm(SESSION_END)
+    start = sh * 60 + sm
+    end = eh * 60 + em
+    if start <= end:
+        return start <= now_min < end
+    return now_min >= start or now_min < end
+
+
+def sast_str(now_utc=None):
+    h, m = sast_now(now_utc)
+    return f"{h:02d}:{m:02d} SAST"
+
+
+def apex_universe(tickers):
+    if not tickers:
+        log("SAFE TICKERS: [] | LUNO TOTAL: 0")
+        return []
+    safe = [t for t in tickers
+            if any(x in t.upper() for x in ALLOWED_SUBSTRINGS)]
+    blocked = [t for t in safe if any(b in t.upper() for b in BTC_BLOCKED)]
+    if blocked:
+        log(f"BTC FAILSAFE: dropping {blocked}", logging.ERROR)
+        safe = [t for t in safe if t not in blocked]
+    log(f"SAFE TICKERS: {safe} | LUNO TOTAL: {len(tickers)}")
+    return safe
+
+
+DEFAULT_STATE = {
+    "mode": "FLAT",
+    "positions": {},
+    "order_seq": 0,
+    "boot_id": "",
+    "trades": 0,
+    "last_nav": 0.0,
+    "peak_nav": 0.0,
+    "last_prices": {},
+    "last_heartbeat_ts": 0,
+    "consecutive_errors": 0,
+    "cooldown_until": {},
+    "paper_balances": {},
+    "paper_seen_orders": {},
+    "drawdown_halt_until": 0.0,
+    "session_close_done": {},
+    "ghost_cost_deployed": 0.0,
+    "_last_daily_nav": 0.0,
+}
+
+
+def load_state():
+    try:
+        with _flock(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r") as f:
+                    s = json.load(f)
+            except FileNotFoundError:
+                s = {}
+    except (json.JSONDecodeError, OSError) as e:
+        notify(f"APEX: state file unreadable ({e}) - refusing to start blank.")
+        log(f"state unreadable: {e}", logging.ERROR)
+        sys.exit(3)
+    merged = dict(DEFAULT_STATE)
+    merged.update(s)
+    if not merged.get("boot_id"):
+        merged["boot_id"] = uuid.uuid4().hex[:8]
+    return merged
+
+
+def save_state(s):
+    tmp = STATE_FILE + ".tmp"
+    with _flock(STATE_FILE):
+        with open(tmp, "w") as f:
+            json.dump(s, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+
+
+def write_heartbeat(nav, stale, unknown=False, extra=None):
+    payload = {"ts": datetime.now(timezone.utc).isoformat(),
+               "epoch": int(time.time()),
+               "nav_zar": round(nav, 2),
+               "nav_stale": stale,
+               "nav_unknown": unknown,
+               "mode": MODE,
+               "session_open": in_session(),
+               "sast": sast_str(),
+               "halt": os.path.exists(HALT_FILE),
+               "ghost_allocation_zar": GHOST_ALLOCATION_ZAR}
+    if extra:
+        payload.update(extra)
+    tmp = HEARTBEAT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, HEARTBEAT_FILE)
+
+
+def next_order_id(state, intent, pair):
+    state["order_seq"] = int(state.get("order_seq", 0)) + 1
+    boot = state.get("boot_id") or uuid.uuid4().hex[:8]
+    state["boot_id"] = boot
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return (f"apex-{boot}-{intent}-{pair.replace('_', '')}-{stamp}-"
+            f"{state['order_seq']}")
+
+
+def log_fill(rec):
+    rec = {"ts": datetime.now(timezone.utc).isoformat(), **rec}
+    try:
+        with _flock(FILLS_FILE):
+            with open(FILLS_FILE, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        log(f"fills log write failed: {e}", logging.WARNING)
+
+
+def log_receipt(trade_id, pair, realized_zar, mode):
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "trade_id": trade_id,
+        "pair": pair,
+        "mode": mode,
+        "realized_zar": round(realized_zar, 2),
+        "withdrawable_zar": None,
+        "withdrawn_to_bank": False,
+        "bank_reference": None,
+        "receipt_photo": None,
+        "withdrawn_at": None,
+    }
+    try:
+        with _flock(RECEIPTS_FILE):
+            with open(RECEIPTS_FILE, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        log(f"receipts write failed: {e}", logging.WARNING)
+
+
+def read_receipts():
+    rows = []
+    try:
+        with open(RECEIPTS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def read_fills():
+    rows = []
+    try:
+        with open(FILLS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def normalize_candle(c):
+    try:
+        if isinstance(c, dict):
+            return {"t": float(c.get("timestamp", c.get("t", 0))),
+                    "o": float(c["open"]), "h": float(c["high"]),
+                    "l": float(c["low"]), "c": float(c["close"]),
+                    "v": float(c.get("volume", c.get("v", 0)) or 0)}
+        return {"t": float(c[0]), "o": float(c[1]), "h": float(c[2]),
+                "l": float(c[3]), "c": float(c[4]),
+                "v": float(c[5]) if len(c) > 5 else 0.0}
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+
+
+_LunoClient = None
+try:
+    from luno_python.client import Client as _LunoClient
+except ImportError:
+    _LunoClient = None
+
+
+class Exchange:
+    def __init__(self, state=None):
+        self.state = state
+        self.authed = bool(LUNO_KEY and LUNO_SECRET)
+        if not self.authed:
+            log("LUNO keys not set - public market data only.",
+                logging.WARNING)
+        self.c = None
+        self._meta, self._fees = {}, {}
+        self._paper_mid_cache = {}
+
+    def clear_caches(self):
+        self._paper_mid_cache.clear()
+
+    def _client(self):
+        if self.c is not None:
+            return self.c
+        if _LunoClient is None:
+            raise DataUnavailable(
+                "luno_python not installed. Run: pip install --user "
+                "luno_python==0.0.10")
+        try:
+            self.c = _LunoClient(api_key_id=LUNO_KEY,
+                                 api_key_secret=LUNO_SECRET)
+        except Exception as e:
+            raise DataUnavailable(f"luno client init failed: {e}") from e
+        return self.c
+
+    def market_meta(self, pair):
+        if pair in self._meta:
+            return self._meta[pair]
+        try:
+            res = self._client().markets(pair=[pair])
+        except DataUnavailable:
+            raise
+        except Exception as e:
+            raise DataUnavailable(f"markets({pair}): {e}") from e
+        rows = res.get("markets", []) if isinstance(res, dict) else []
+        if not rows:
+            raise DataUnavailable(f"markets({pair}): no rows")
+        self._meta[pair] = rows[0]
+        return self._meta[pair]
+
+    def min_base_volume(self, pair):
+        try:
+            return float(self.market_meta(pair).get("min_volume", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def taker_fee_pct(self, pair):
+        if pair in self._fees:
+            return self._fees[pair]
+        if not self.authed:
+            self._fees[pair] = PAPER_FEE_PCT
+            return PAPER_FEE_PCT
+        try:
+            info = self._client().get_fee_info(pair=pair)
+            fee = float(info.get("taker_fee", 0)) * 100.0
+        except DataUnavailable:
+            raise
+        except Exception as e:
+            raise DataUnavailable(f"get_fee_info({pair}): {e}") from e
+        self._fees[pair] = fee
+        return fee
+
+    @staticmethod
+    def _is_xstock(pair):
+        base = pair.split("_")[0].upper()
+        return base.startswith("MSTR") or base.startswith("STRC")
+
+    def _paper_mid(self, pair):
+        if pair in self._paper_mid_cache:
+            return self._paper_mid_cache[pair]
+        try:
+            _, zar, _ = _get_live_price_fallback(pair)
+            self._paper_mid_cache[pair] = zar
+            return zar
+        except Exception:
+            fallback = 2400.0 if "MSTR" in pair else 1020.0
+            self._paper_mid_cache[pair] = fallback
+            return fallback
+
+    def quote(self, pair):
+        try:
+            t = self._client().get_ticker(pair=pair)
+        except DataUnavailable:
+            raise
+        except Exception as e:
+            msg = str(e)
+            luno_closed = self._is_xstock(pair) and (
+                "Market not available" in msg
+                or "ErrMarketUnavailable" in msg
+                or "ErrAPIKeyNotFound" in msg)
+            if luno_closed and self._paper_mode():
+                try:
+                    usd, zar, fx = _get_live_price_fallback(pair)
+                    log(f"PAPER QUOTE {pair}: Yahoo ZAR {zar:.2f} "
+                        f"(USD {usd:.2f} x FX {fx:.2f}) - synthetic",
+                        logging.INFO)
+                    self._paper_mid_cache[pair] = zar
+                    return zar * 0.999, zar * 1.001, zar, 0.2, 0.0
+                except Exception as fe:
+                    log(f"PAPER QUOTE {pair}: yahoo failed ({fe})",
+                        logging.WARNING)
+            if luno_closed:
+                try:
+                    usd, zar, fx = _get_live_price_fallback(pair)
+                    log(f"APEX FALLBACK {pair}: Yahoo ZAR {zar:.2f} - "
+                        f"LUNO CLOSED, NOT TRADEABLE", logging.INFO)
+                except Exception:
+                    pass
+                raise DataUnavailable(
+                    f"ticker {pair} Luno closed: {e}") from e
+            raise DataUnavailable(f"ticker {pair}: {e}") from e
+        try:
+            bid = float(t.get("bid") or 0)
+            ask = float(t.get("ask") or 0)
+            last = float(t.get("last_trade") or 0)
+            ts_ms = float(t.get("timestamp") or 0)
+        except (TypeError, ValueError) as e:
+            raise DataUnavailable(f"ticker {pair} unparseable: {t}") from e
+        if last <= 0:
+            raise DataUnavailable(f"ticker {pair} has no last trade")
+        if bid > 0 and ask > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            spread_pct = (ask - bid) / mid * 100.0
+        else:
+            spread_pct = float("nan")
+        age_s = (max(0.0, time.time() - ts_ms / 1000.0)
+                 if ts_ms > 0 else float("nan"))
+        self._paper_mid_cache[pair] = last
+        return bid, ask, last, spread_pct, age_s
+
+    def book(self, pair):
+        if self._paper_mode():
+            mid = self._paper_mid(pair)
+            bids = []
+            asks = []
+            for i in range(1, 11):
+                price_bid = mid * (1 - 0.0005 * i)
+                price_ask = mid * (1 + 0.0005 * i)
+                vol = 5000.0 / mid if mid > 0 else 0.0
+                bids.append((price_bid, vol))
+                asks.append((price_ask, vol))
+            bids = sorted(bids, key=lambda x: x[0], reverse=True)
+            asks = sorted(asks, key=lambda x: x[0])
+            return bids, asks
+
+        try:
+            ob = self._client().get_order_book(pair=pair)
+        except DataUnavailable:
+            raise
+        except Exception as e:
+            raise DataUnavailable(f"order_book {pair}: {e}") from e
+
+        def ladder(rows, reverse):
+            out = []
+            for r in rows or []:
+                try:
+                    out.append((float(r["price"]), float(r["volume"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return sorted(out, key=lambda x: x[0], reverse=reverse)
+
+        return ladder(ob.get("bids"), True), ladder(ob.get("asks"), False)
+
+    def fill_estimate(self, pair, side, target, mid=None):
+        bids, asks = self.book(pair)
+        ladder = asks if side == "BUY" else bids
+        if not ladder:
+            raise DataUnavailable(f"{pair} {side}: empty book")
+        if mid is None:
+            if not bids or not asks:
+                raise DataUnavailable(f"{pair}: one-sided book, no mid")
+            mid = (bids[0][0] + asks[0][0]) / 2.0
+        remaining, cost, base = float(target), 0.0, 0.0
+        for price, volume in ladder:
+            if remaining <= 0:
+                break
+            if side == "BUY":
+                take_zar = min(remaining, price * volume)
+                cost += take_zar
+                base += take_zar / price
+                remaining -= take_zar
+            else:
+                take_base = min(remaining, volume)
+                cost += take_base * price
+                base += take_base
+                remaining -= take_base
+        if base <= 0:
+            raise DataUnavailable(f"{pair} {side}: no fillable depth")
+        vwap = cost / base
+        return {"vwap": vwap, "mid": mid,
+                "impact_pct": abs(vwap / mid - 1.0) * 100.0,
+                "filled_zar": cost, "filled_base": base,
+                "complete": remaining <= 1e-9,
+                "shortfall": max(0.0, remaining)}
+
+    def max_size_within_impact(self, pair, side, ceiling, max_impact_pct,
+                               mid=None):
+        lo, hi, best = 0.0, float(ceiling), 0.0
+        for _ in range(24):
+            trial = (lo + hi) / 2.0
+            if trial <= 0:
+                break
+            try:
+                est = self.fill_estimate(pair, side, trial, mid=mid)
+            except DataUnavailable:
+                hi = trial
+                continue
+            if est["complete"] and est["impact_pct"] <= max_impact_pct:
+                best, lo = trial, trial
+            else:
+                hi = trial
+        return best
+
+    def candles(self, pair, duration=CANDLE_SECONDS, count=30):
+        since = int((time.time() - duration * (count + 2)) * 1000)
+        try:
+            res = self._client().get_candles(duration=duration, pair=pair,
+                                             since=since)
+        except DataUnavailable:
+            raise
+        except Exception as e:
+            if self._is_xstock(pair):
+                log(f"Using synthetic fallback candles for {pair} (Luno: {e})",
+                    logging.INFO)
+                return _get_fallback_candles(pair, count)
+            raise DataUnavailable(f"candles {pair}: {e}") from e
+        return res.get("candles", []) or []
+
+    def fetch_candles(self, pair, duration, days):
+        end_ms = time.time() * 1000
+        start_ms = end_ms - days * 86400 * 1000
+        out, since = {}, start_ms
+        for _ in range(60):
+            try:
+                res = self._client().get_candles(duration=duration, pair=pair,
+                                                 since=int(since))
+            except DataUnavailable:
+                raise
+            except Exception as e:
+                if self._is_xstock(pair):
+                    log(f"fetch_candles {pair}: empty on Luno error ({e})",
+                        logging.WARNING)
+                    return []
+                raise DataUnavailable(f"candles {pair}: {e}") from e
+            batch = [normalize_candle(c) for c in res.get("candles", []) or []]
+            batch = [c for c in batch if c]
+            if not batch:
+                break
+            for c in batch:
+                out[c["t"]] = c
+            last_t = batch[-1]["t"]
+            if last_t >= end_ms:
+                break
+            since = last_t + duration * 1000
+        return [out[k] for k in sorted(out) if start_ms <= k <= end_ms]
+
+    def all_tickers(self):
+        try:
+            res = self._client().tickers()
+            return [t.get("pair", "") for t in res.get("tickers", [])]
+        except Exception as e:
+            if self._paper_mode() and not in_session():
+                return [f"PAIR{i}_ZAR" for i in range(145)]
+            if self._paper_mode() and in_session():
+                return [PAIR, STRC_PAIR] + [f"PAIR{i}_ZAR" for i in range(10)]
+            log(f"tickers() failed: {e}", logging.WARNING)
+            return []
+
+    def _paper_mode(self):
+        return MODE != "LIVE" and self.state is not None
+
+    def _paper_balances(self):
+        pb = self.state.setdefault("paper_balances", {})
+        if "ZAR" not in pb:
+            pb["ZAR"] = {"total": PAPER_STARTING_ZAR,
+                         "free": PAPER_STARTING_ZAR}
+        return pb
+
+    def balances(self):
+        if self._paper_mode():
+            pb = self._paper_balances()
+            return {k: dict(v) for k, v in pb.items()}
+        try:
+            res = self._client().get_balances()
+        except DataUnavailable:
+            raise
+        except Exception as e:
+            msg = str(e)
+            if ("ErrAPIKeyNotFound" in msg or "API key not found" in msg) \
+                    and self.state is not None:
+                log(">>> APEX: get_balances ErrAPIKeyNotFound -> falling back "
+                    "to PAPER balances, continuing.", logging.WARNING)
+                pb = self._paper_balances()
+                return {k: dict(v) for k, v in pb.items()}
+            raise ApexError(f"get_balances: {e}") from e
+        out = {}
+        for b in res.get("balance", []):
+            asset = str(b.get("asset", "")).upper()
+            try:
+                total = float(b.get("balance") or 0)
+            except (TypeError, ValueError):
+                total = 0.0
+            unenc = b.get("unencumbered_balance")
+            try:
+                free = float(unenc) if unenc is not None else total
+            except (TypeError, ValueError):
+                free = 0.0
+            prev = out.get(asset)
+            out[asset] = {"total": total + (prev["total"] if prev else 0.0),
+                          "free": free + (prev["free"] if prev else 0.0)}
+        return out
+
+    @staticmethod
+    def _paper_asset_name(pair):
+        return pair.split("_")[0].upper()
+
+    def _paper_apply_buy(self, pair, filled_base, filled_zar, fee_zar):
+        pb = self._paper_balances()
+        zar = pb.get("ZAR", {"total": 0.0, "free": 0.0})
+        asset = self._paper_asset_name(pair)
+        held = pb.get(asset, {"total": 0.0, "free": 0.0})
+        total_cost = filled_zar + fee_zar
+        if zar["free"] < total_cost - 1e-9:
+            raise DataUnavailable(
+                f"paper: insufficient ZAR ({zar['free']:.2f} < "
+                f"{total_cost:.2f})")
+        pb["ZAR"] = {"total": zar["total"] - total_cost,
+                     "free": zar["free"] - total_cost}
+        pb[asset] = {"total": held["total"] + filled_base,
+                     "free": held["free"] + filled_base}
+
+    def _paper_apply_sell(self, pair, filled_base, filled_zar, fee_zar):
+        pb = self._paper_balances()
+        zar = pb.get("ZAR", {"total": 0.0, "free": 0.0})
+        asset = self._paper_asset_name(pair)
+        held = pb.get(asset, {"total": 0.0, "free": 0.0})
+        if held["free"] < filled_base - 1e-9:
+            raise DataUnavailable(
+                f"paper: insufficient {asset} ({held['free']:.8f} < "
+                f"{filled_base:.8f})")
+        pb[asset] = {"total": max(0.0, held["total"] - filled_base),
+                     "free": max(0.0, held["free"] - filled_base)}
+        net = filled_zar - fee_zar
+        pb["ZAR"] = {"total": zar["total"] + net, "free": zar["free"] + net}
+
+    def market_buy(self, pair, zar_amount, client_order_id):
+        if self._paper_mode():
+            seen = self.state.setdefault("paper_seen_orders", {})
+            if client_order_id in seen:
+                return {"order_id": client_order_id, "duplicate": True}
+            bids, asks = self.book(pair)
+            if not asks:
+                raise DataUnavailable(f"paper BUY {pair}: empty asks")
+            est = self.fill_estimate(pair, "BUY", zar_amount)
+            if not est["complete"]:
+                raise DataUnavailable(
+                    f"paper BUY {pair}: short R{est['shortfall']:.2f}")
+            fee_zar = est["filled_zar"] * self.taker_fee_pct(pair) / 100.0
+            self._paper_apply_buy(pair, est["filled_base"],
+                                  est["filled_zar"], fee_zar)
+            seen[client_order_id] = {"side": "BUY", "pair": pair,
+                                     "base": est["filled_base"],
+                                     "zar": est["filled_zar"],
+                                     "fee_zar": fee_zar}
+            return {"order_id": client_order_id,
+                    "filled_base": est["filled_base"],
+                    "filled_zar": est["filled_zar"], "vwap": est["vwap"],
+                    "fee_zar": fee_zar, "paper": True}
+        return self._client().post_market_order(
+            pair=pair, type="BUY", counter_volume=f"{zar_amount:.2f}",
+            client_order_id=client_order_id)
+
+    def market_sell(self, pair, base_volume, client_order_id):
+        if self._paper_mode():
+            seen = self.state.setdefault("paper_seen_orders", {})
+            if client_order_id in seen:
+                return {"order_id": client_order_id, "duplicate": True}
+            bids, asks = self.book(pair)
+            if not bids:
+                raise DataUnavailable(f"paper SELL {pair}: empty bids")
+            est = self.fill_estimate(pair, "SELL", base_volume)
+            if not est["complete"]:
+                raise DataUnavailable(
+                    f"paper SELL {pair}: short {est['shortfall']:.8f}")
+            fee_zar = est["filled_zar"] * self.taker_fee_pct(pair) / 100.0
+            self._paper_apply_sell(pair, est["filled_base"],
+                                   est["filled_zar"], fee_zar)
+            seen[client_order_id] = {"side": "SELL", "pair": pair,
+                                     "base": est["filled_base"],
+                                     "zar": est["filled_zar"],
+                                     "fee_zar": fee_zar}
+            return {"order_id": client_order_id,
+                    "filled_base": est["filled_base"],
+                    "filled_zar": est["filled_zar"], "vwap": est["vwap"],
+                    "fee_zar": fee_zar, "paper": True}
+        return self._client().post_market_order(
+            pair=pair, type="SELL", base_volume=f"{base_volume:.8f}",
+            client_order_id=client_order_id)
+
+    def cancel_open_orders(self, pair):
+        if self._paper_mode():
+            return True
+        try:
+            res = self._client().list_orders(pair=pair)
+        except Exception as e:
+            log(f"list_orders({pair}) unavailable: {e}", logging.WARNING)
+            return False
+        ok = True
+        for o in res.get("orders", []) or []:
+            if o.get("state") == "OPEN":
+                try:
+                    self._client().stop_order(order_id=o["order_id"])
+                    log(f"cancelled stale order {o['order_id']} on {pair}")
+                except Exception as e:
+                    log(f"stop_order({o.get('order_id')}) failed: {e}",
+                        logging.WARNING)
+                    ok = False
+        return ok
+
+
+@dataclass
+class Decision:
+    action: str
+    expected_pct: float
+    gate_pct: float
+    reason: str
+
+
+class Signal:
+    name = "base"
+
+    def min_bars(self):
+        return 2
+
+    def decide(self, *args, **kwargs):
+        return Decision("HOLD", 0.0, 0.0, "base signal")
+
+
+class NullSignal(Signal):
+    name = "null"
+
+    def decide(self, *args, **kwargs):
+        return Decision("HOLD", 0.0, 0.0, "null signal")
+
+
+class SmaCrossSignal(Signal):
+    name = "smacross"
+
+    def __init__(self, fast=FAST_N, slow=SLOW_N, edge_k=EDGE_K,
+                 stop_pct=STOP_PCT):
+        self.fast, self.slow, self.edge_k, self.stop = (fast, slow, edge_k,
+                                                        stop_pct)
+
+    def min_bars(self):
+        return self.slow + 1
+
+    def _edge(self, f, s):
+        return min(50.0, abs(f - s) / s * 100.0 * self.edge_k) if s else 0.0
+
+    def decide(self, candles, in_position, entry_price, *args, **kwargs):
+        closes = [c["c"] for c in candles if c]
+        if len(closes) < self.min_bars():
+            return Decision("HOLD", 0.0, 0.0, "warming up")
+        f = sum(closes[-self.fast:]) / self.fast
+        s = sum(closes[-self.slow:]) / self.slow
+        pf = sum(closes[-self.fast - 1:-1]) / self.fast
+        ps = sum(closes[-self.slow - 1:-1]) / self.slow
+        px = closes[-1]
+        if in_position and self.stop > 0 and entry_price > 0 \
+                and px < entry_price * (1 - self.stop):
+            return Decision("SELL", 0.0, 0.0,
+                            f"stop-loss {px:.2f} < "
+                            f"{entry_price * (1 - self.stop):.2f}")
+        if not in_position and pf <= ps and f > s:
+            return Decision("BUY", self._edge(f, s), 0.0,
+                            f"sma{self.fast} crossed above sma{self.slow}")
+        if in_position and pf >= ps and f < s:
+            return Decision("SELL", self._edge(f, s), 0.0, "crossed down")
+        return Decision("HOLD", 0.0, 0.0,
+                        f"sma{self.fast} {f:.2f} vs sma{self.slow} {s:.2f}")
+
+
+class FeeMomentumSignal(Signal):
+    name = "fee_momentum"
+
+    def decide(self, us_move_pct, beta, gate_pct, in_position, *args,
+               **kwargs):
+        # us_move_pct is a FRACTION (0.02 = 2%). gate_pct is percentage
+        # points (1.70 = 1.70%). Multiply by 100 before comparing.
+        expected = abs(us_move_pct) * 100.0 * beta
+        if expected < gate_pct:
+            return Decision("HOLD", expected, gate_pct,
+                            f"expected {expected:.2f}% < gate "
+                            f"{gate_pct:.2f}% - DO NOTHING")
+        if not in_position and us_move_pct > 0:
+            return Decision("BUY", expected, gate_pct, "US momentum up")
+        if in_position and us_move_pct < 0:
+            return Decision("SELL", expected, gate_pct, "US momentum reversed")
+        return Decision("HOLD", expected, gate_pct,
+                        "already positioned with momentum")
+
+
+SIGNALS = {"null": NullSignal, "smacross": SmaCrossSignal,
+           "fee_momentum": FeeMomentumSignal}
+
+
+def build_signal(name):
+    if name not in SIGNALS:
+        raise ApexError(f"unknown signal '{name}' "
+                        f"(choose from {sorted(SIGNALS)})")
+    return SIGNALS[name]()
+
+
+def resolve_asset(balances, pair):
+    base = pair.split("_")[0]
+    for name in (base.upper(), base, base.lower()):
+        if name in balances:
+            return balances[name]
+    for k, v in balances.items():
+        if k.upper() == base.upper():
+            return v
+    return {"total": 0.0, "free": 0.0}
+
+
+def build_snapshot(ex, state):
+    balances = ex.balances()
+    zar = balances.get("ZAR", {"total": 0.0, "free": 0.0})
+    legs, nav, stale, unknown = {}, zar["total"], False, False
+
+    for pair in (PAIR, STRC_PAIR):
+        holding = resolve_asset(balances, pair)
+        last_known = float(state["last_prices"].get(pair, 0) or 0)
+        try:
+            bid, ask, last, spread, age_s = ex.quote(pair)
+            reason = ""
+            if last_known > 0 and abs(last / last_known - 1) > MAX_PRICE_JUMP:
+                reason = f"price_jump {last / last_known - 1:+.1%}"
+                state.setdefault("cooldown_until", {})[pair] = \
+                    time.time() + COOLDOWN_S
+                notify(f"APEX: {pair} moved {last / last_known - 1:+.1%} "
+                       f"(R{last_known:.2f} -> R{last:.2f}). Leg blocked for "
+                       f"{COOLDOWN_S / 60:.0f}m.",
+                       key=f"jump-{pair}", min_gap_seconds=3600)
+            elif age_s == age_s and age_s > MAX_TICKER_AGE_S:
+                reason = f"stale_tape {age_s / 60:.0f}m"
+            elif spread != spread:
+                reason = "no_two_sided_market"
+            # Spread is NOT a hard block. Record it separately so BUY can
+            # be blocked at MAX_SPREAD_PCT while SELL gets its own, wider
+            # MAX_EXIT_SPREAD_PCT ceiling (checked in plan_trade).
+            spread_reason = ""
+            if spread == spread and spread > MAX_SPREAD_PCT:
+                spread_reason = f"spread {spread:.2f}% > {MAX_SPREAD_PCT:.2f}%"
+            legs[pair] = {**holding, "price": last, "bid": bid, "ask": ask,
+                          "spread_pct": spread, "age_s": age_s,
+                          "tradeable": reason == "", "reason": reason,
+                          "spread_reason": spread_reason}
+            state["last_prices"][pair] = last
+            nav += holding["total"] * last
+        except DataUnavailable as e:
+            stale = True
+            reason = (f"luno_closed: {e}" if "Luno closed" in str(e)
+                      else f"no_price: {e}")
+            log(f"{pair} unavailable: {e}", logging.WARNING)
+            legs[pair] = {**holding, "price": last_known or None,
+                          "bid": 0.0, "ask": 0.0,
+                          "spread_pct": float("nan"), "age_s": float("nan"),
+                          "tradeable": False, "reason": reason,
+                          "spread_reason": ""}
+            if last_known > 0:
+                nav += holding["total"] * last_known
+            elif holding["total"] > 0:
+                unknown = True
+
+    now = time.time()
+    cd = state.get("cooldown_until", {})
+    state["cooldown_until"] = {k: v for k, v in cd.items()
+                               if v > now or k in (PAIR, STRC_PAIR)}
+    return {"zar": zar, "legs": legs, "nav": nav, "nav_stale": stale,
+            "nav_unknown": unknown}
+
+
+def ghost_exposure_cost(state):
+    return float(state.get("ghost_cost_deployed", 0.0))
+
+
+def ghost_exposure_mark(snapshot):
+    total = 0.0
+    for leg in snapshot["legs"].values():
+        px = leg.get("price") or 0
+        total += leg["total"] * px
+    return total
+
+
+def compute_gate_pct(ex, pair, snapshot, size_zar):
+    leg = snapshot["legs"][pair]
+    try:
+        fee_pct = ex.taker_fee_pct(pair)
+    except DataUnavailable:
+        fee_pct = PAPER_FEE_PCT
+
+    spread = leg.get("spread_pct", 0.0)
+    if spread != spread or spread is None:
+        spread = 0.0
+
+    mid = leg["price"] or 0
+    if leg["bid"] > 0 and leg["ask"] > 0:
+        mid = (leg["bid"] + leg["ask"]) / 2.0
+
+    impact_in = 0.0
+    impact_out = 0.0
+    try:
+        entry_est = ex.fill_estimate(pair, "BUY", size_zar, mid=mid)
+        impact_in = entry_est["impact_pct"]
+        exit_est = ex.fill_estimate(pair, "SELL", entry_est["filled_base"],
+                                    mid=mid)
+        impact_out = exit_est["impact_pct"]
+    except DataUnavailable:
+        pass
+
+    gate = fee_pct * 2 + spread + impact_in + impact_out
+    gate = max(gate, FEE_BREAKEVEN_FLOOR_PCT)
+    return gate, {"fee_pct": fee_pct, "spread_pct": spread,
+                  "impact_in": impact_in, "impact_out": impact_out}
+
+
+def plan_trade(ex, action, pair, snapshot, state):
+    leg = snapshot["legs"][pair]
+    if not leg["tradeable"]:
+        return {"blocked": leg["reason"]}
+    if action == "BUY" and leg.get("spread_reason"):
+        return {"blocked": leg["spread_reason"]}
+    mid = ((leg["bid"] + leg["ask"]) / 2.0
+           if leg["bid"] > 0 and leg["ask"] > 0 else leg["price"])
+    try:
+        min_base = ex.min_base_volume(pair)
+        fee_pct = ex.taker_fee_pct(pair)
+    except DataUnavailable as e:
+        return {"blocked": f"metadata unavailable: {e}"}
+
+    try:
+        if action == "BUY":
+            deployed = ghost_exposure_cost(state)
+            remaining_cap = max(0.0, GHOST_ALLOCATION_ZAR - deployed)
+            ceiling = min(snapshot["zar"]["free"], GHOST_MAX_TRADE_ZAR,
+                          remaining_cap)
+            if ceiling < MIN_TRADE_ZAR:
+                return {"blocked": f"capacity R{ceiling:.2f} < floor "
+                                   f"R{MIN_TRADE_ZAR:.2f} "
+                                   f"(deployed cost R{deployed:.2f}/"
+                                   f"R{GHOST_ALLOCATION_ZAR:.2f})"}
+            size = ex.max_size_within_impact(pair, "BUY", ceiling,
+                                             MAX_IMPACT_PCT, mid)
+            if size < MIN_TRADE_ZAR:
+                return {"blocked": f"absorbable R{size:.2f} < floor "
+                                   f"R{MIN_TRADE_ZAR:.2f}"}
+            entry = ex.fill_estimate(pair, "BUY", size, mid=mid)
+            if entry["filled_base"] < min_base:
+                return {"blocked": f"absorbable {entry['filled_base']:.8f} "
+                                   f"< exchange minimum {min_base:.8f}"}
+            exit_est = ex.fill_estimate(pair, "SELL", entry["filled_base"],
+                                        mid=mid)
+            fee_zar = entry["filled_zar"] * fee_pct / 100.0
+            return {"size": size, "impact_in": entry["impact_pct"],
+                    "impact_out": exit_est["impact_pct"],
+                    "exit_complete": exit_est["complete"],
+                    "entry_vwap": entry["vwap"],
+                    "exit_vwap": exit_est["vwap"],
+                    "entry_base": entry["filled_base"],
+                    "entry_fee_zar": fee_zar, "ceiling": ceiling}
+        if action == "SELL":
+            spread = leg.get("spread_pct", float("nan"))
+            if spread == spread and spread > MAX_EXIT_SPREAD_PCT:
+                return {"blocked": f"exit spread {spread:.2f}% > "
+                                   f"{MAX_EXIT_SPREAD_PCT:.2f}%"}
+            free = leg["free"]
+            if free <= 0 or free < min_base:
+                return {"blocked": f"free {free:.8f} below minimum "
+                                   f"{min_base:.8f}"}
+            exit_est = ex.fill_estimate(pair, "SELL", free, mid=mid)
+            exit_fee_zar = exit_est["filled_zar"] * fee_pct / 100.0
+            return {"size": free, "impact_in": 0.0,
+                    "impact_out": exit_est["impact_pct"],
+                    "exit_complete": exit_est["complete"],
+                    "exit_vwap": exit_est["vwap"],
+                    "exit_fee_zar": exit_fee_zar, "ceiling": free}
+    except DataUnavailable as e:
+        return {"blocked": str(e)}
+    return {"blocked": f"unknown action {action}"}
+
+
+def _fresh_pos():
+    return {"entry_price": 0.0, "entry_fee_zar": 0.0,
+            "entry_base": 0.0, "entry_cost_zar": 0.0}
+
+
+def execute(ex, state, action, pair, plan, reason):
+    oid = next_order_id(state, action.lower(), pair)
+    save_state(state)
+
+    positions = state.setdefault("positions", {})
+    pos = positions.setdefault(pair, _fresh_pos())
+
+    rec = {"mode": MODE, "pair": pair, "action": action, "oid": oid,
+           "reason": reason}
+
+    if action == "BUY":
+        res = ex.market_buy(pair, plan["size"], oid)
+        if isinstance(res, dict) and res.get("duplicate"):
+            log(f"BUY {pair} {oid} duplicate - ignored")
+            return False
+        state["trades"] += 1
+        pos["entry_price"] = plan["entry_vwap"]
+        pos["entry_fee_zar"] = plan["entry_fee_zar"]
+        pos["entry_base"] = plan["entry_base"]
+        pos["entry_cost_zar"] = plan["size"]
+        state["ghost_cost_deployed"] = \
+            state.get("ghost_cost_deployed", 0.0) + plan["size"]
+        rec.update(size_zar=plan["size"], vwap=plan["entry_vwap"],
+                   impact_pct=plan["impact_in"],
+                   fee_zar=round(plan["entry_fee_zar"], 2))
+        log_fill(rec)
+        if MODE == "LIVE":
+            notify(f"APEX BUY {pair} R{plan['size']:.2f} "
+                   f"(impact {plan['impact_in']:.2f}%) - {reason}")
+        else:
+            log(f"[PAPER] BUY {pair} R{plan['size']:.2f} @ "
+                f"{plan['entry_vwap']:.4f} fee R{plan['entry_fee_zar']:.2f} "
+                f"id={oid}")
+        return True
+
+    if action == "SELL":
+        entry_fee_total = float(pos.get("entry_fee_zar") or 0.0)
+        entry_px = float(pos.get("entry_price") or 0.0)
+        entry_base = float(pos.get("entry_base") or 0.0)
+        entry_cost_zar = float(pos.get("entry_cost_zar") or 0.0)
+
+        if entry_base > 0:
+            sold_fraction = min(1.0, plan["size"] / entry_base)
+        else:
+            sold_fraction = 1.0
+
+        entry_fee = entry_fee_total * sold_fraction
+        exit_fee = plan.get("exit_fee_zar", 0.0)
+        gross = (plan["exit_vwap"] - entry_px) * plan["size"]
+        pnl_net = gross - entry_fee - exit_fee
+
+        res = ex.market_sell(pair, plan["size"], oid)
+        if isinstance(res, dict) and res.get("duplicate"):
+            log(f"SELL {pair} {oid} duplicate - ignored")
+            return False
+
+        state["trades"] += 1
+
+        cost_reduction = entry_cost_zar * sold_fraction
+        state["ghost_cost_deployed"] = max(
+            0.0, state.get("ghost_cost_deployed", 0.0) - cost_reduction)
+        pos["entry_cost_zar"] = max(0.0, entry_cost_zar - cost_reduction)
+        pos["entry_fee_zar"] = max(0.0, entry_fee_total - entry_fee)
+        pos["entry_base"] = max(0.0, entry_base - plan["size"])
+
+        if pos["entry_base"] <= 1e-12:
+            pos["entry_price"] = 0.0
+            pos["entry_fee_zar"] = 0.0
+            pos["entry_base"] = 0.0
+            pos["entry_cost_zar"] = 0.0
+
+        rec.update(size_base=plan["size"], vwap=plan["exit_vwap"],
+                   impact_pct=plan["impact_out"],
+                   gross_pnl_zar=round(gross, 2),
+                   entry_fee_zar=round(entry_fee, 2),
+                   exit_fee_zar=round(exit_fee, 2),
+                   pnl_zar=round(pnl_net, 2))
+        log_fill(rec)
+        log_receipt(oid, pair, pnl_net, MODE)
+        if MODE == "LIVE":
+            notify(f"APEX SELL {pair} {plan['size']:.8f} net R{pnl_net:+.2f} "
+                   f"- {reason}\nMark withdrawal: apex.py mark-withdrawn {oid}")
+        else:
+            log(f"[PAPER] SELL {pair} {plan['size']:.8f} @ "
+                f"{plan['exit_vwap']:.4f} net R{pnl_net:+.2f} id={oid}")
+        return True
+
+    return False
+
+
+def _claim_liquidate():
+    if os.path.exists(LIQUIDATE_DONE):
+        return "done"
+    if os.path.exists(LIQUIDATE_INPROGRESS):
+        return "inprogress"
+    if os.path.exists(LIQUIDATE_FAILED):
+        try:
+            os.replace(LIQUIDATE_FAILED, LIQUIDATE_FAILED + ".prev")
+        except OSError:
+            pass
+    if not os.path.exists(LIQUIDATE_FILE):
+        return None
+    try:
+        os.replace(LIQUIDATE_FILE, LIQUIDATE_INPROGRESS)
+    except OSError as e:
+        log(f"could not claim LIQUIDATE: {e}", logging.ERROR)
+        return None
+    return "claimed"
+
+
+def _finalize_liquidate(ok):
+    try:
+        os.replace(LIQUIDATE_INPROGRESS,
+                   LIQUIDATE_DONE if ok else LIQUIDATE_FAILED)
+    except FileNotFoundError:
+        pass
+
+
+def liquidate_all(ex, state, *, claim=True):
+    if claim:
+        c = _claim_liquidate()
+        if c == "done":
+            log("LIQUIDATE.done present - trading disabled.", logging.WARNING)
+            return True
+        if c == "inprogress":
+            log("LIQUIDATE.inprogress present - manual review required.",
+                logging.ERROR)
+            return False
+
+    notify("APEX: LIQUIDATE - selling all legs to ZAR.")
+    snapshot = build_snapshot(ex, state)
+    liq_impact = MAX_IMPACT_PCT * LIQ_IMPACT_MULT
+    failures, sold = [], []
+    for pair in (PAIR, STRC_PAIR):
+        leg = snapshot["legs"][pair]
+        if leg["total"] <= 0:
+            continue
+        if leg["free"] < leg["total"]:
+            failures.append(f"{pair}: "
+                            f"{leg['total'] - leg['free']:.8f} locked in "
+                            f"open orders")
+        remaining = leg["free"]
+        try:
+            min_base = ex.min_base_volume(pair)
+        except DataUnavailable as e:
+            failures.append(f"{pair}: min_volume unavailable: {e}")
+            continue
+        if min_base <= 0:
+            failures.append(f"{pair}: cannot determine minimum order size")
+            continue
+        for _ in range(50):
+            if remaining < min_base:
+                break
+            mid = leg["price"]
+            try:
+                chunk = ex.max_size_within_impact(pair, "SELL", remaining,
+                                                  liq_impact, mid)
+            except DataUnavailable as e:
+                failures.append(f"{pair}: book unreadable: {e}")
+                break
+            if chunk < min_base:
+                failures.append(
+                    f"{pair}: residual {remaining:.8f} below exchange min "
+                    f"{min_base:.8f} - cannot reduce")
+                break
+            try:
+                oid = next_order_id(state, "liq", pair)
+                save_state(state)
+                res = ex.market_sell(pair, chunk, oid)
+                if isinstance(res, dict) and res.get("duplicate"):
+                    log(f"LIQUIDATE {pair} {oid} duplicate - skip")
+                    break
+                state["trades"] += 1
+                log_fill({"mode": MODE, "pair": pair, "action": "SELL",
+                          "oid": oid, "reason": "liquidate",
+                          "size_base": chunk})
+                sold.append(f"{pair}: {chunk:.8f}"
+                            f"{'' if MODE == 'LIVE' else ' [PAPER]'}")
+                remaining -= chunk
+            except Exception as e:
+                failures.append(f"{pair}: SELL FAILED {e}")
+                break
+        if remaining >= min_base:
+            failures.append(f"{pair}: residual {remaining:.8f} unsold")
+
+    ok = not failures
+
+    if ok:
+        state["ghost_cost_deployed"] = 0.0
+        for pair in (PAIR, STRC_PAIR):
+            state.setdefault("positions", {})[pair] = _fresh_pos()
+
+    save_state(state)
+    if ok:
+        notify("APEX LIQUIDATE COMPLETE:\n" +
+               ("\n".join(sold) or "nothing held"))
+        log("liquidation complete")
+    else:
+        notify("APEX LIQUIDATE INCOMPLETE:\n" + "\n".join(sold + failures) +
+               "\nManual action required on Luno.")
+        log("liquidation incomplete: " + "; ".join(failures), logging.ERROR)
+    if claim:
+        _finalize_liquidate(ok)
+    return ok
+
+
+def _drawdown_halted(state, nav):
+    if MAX_DRAWDOWN_PCT <= 0:
+        return False
+    peak = float(state.get("peak_nav") or 0.0)
+    if peak <= 0:
+        return False
+    dd = (peak - nav) / peak
+    if dd <= MAX_DRAWDOWN_PCT:
+        return False
+    now = time.time()
+    until = float(state.get("drawdown_halt_until") or 0.0)
+    if until < now:
+        state["drawdown_halt_until"] = now + 3600
+        notify(f"APEX: drawdown {dd * 100:.2f}% >= "
+               f"{MAX_DRAWDOWN_PCT * 100:.2f}% - entries halted.")
+    return True
+
+
+def fetch_us_momentum(base):
+    sym = _YAHOO_TICKER.get(base)
+    if not sym:
+        return None
+    try:
+        return _yahoo_momentum(sym)
+    except Exception as e:
+        log(f"yahoo momentum {sym} failed: {e}", logging.WARNING)
+        return None
+
+
+def _force_close(ex, state, snapshot, pair, reason):
+    if snapshot["legs"][pair]["total"] <= 0:
+        return True
+    plan = plan_trade(ex, "SELL", pair, snapshot, state)
+    if "blocked" in plan:
+        log(f"FORCE-CLOSE {pair} blocked: {plan['blocked']} - WILL RETRY "
+            f"NEXT CYCLE", logging.WARNING)
+        return False
+    ok = execute(ex, state, "SELL", pair, plan, reason)
+    if not ok:
+        return False
+    post = build_snapshot(ex, state)
+    return post["legs"][pair]["total"] <= 0
+
+
+def _handle_session_close(ex, state, snapshot):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    closed = state.setdefault("session_close_done", {})
+    for pair in (PAIR, STRC_PAIR):
+        if snapshot["legs"][pair]["total"] <= 0:
+            closed[pair] = today
+            continue
+        if closed.get(pair) == today:
+            continue
+        log(f"SESSION CLOSED - force-closing {pair}")
+        if _force_close(ex, state, snapshot, pair,
+                        "session end force close"):
+            closed[pair] = today
+        else:
+            log(f"SESSION CLOSE {pair} still has position - will retry "
+                f"next cycle", logging.WARNING)
+
+
+def _log_state_line(state, snapshot, nav):
+    legs_txt = " ".join(
+        f"{p.split('_')[0]}={v['total']:.6f}@{(v['price'] or 0):.2f}"
+        f"{'' if v['tradeable'] else '(blocked:' + (v['reason'] or '')[:24] + ')'}"
+        for p, v in snapshot["legs"].items())
+    tag = (" STALE" if snapshot["nav_stale"]
+           else (" UNKNOWN" if snapshot["nav_unknown"] else ""))
+    log(f"NAV R{nav:,.2f}{tag} ZAR {snapshot['zar']['total']:.2f} {legs_txt} "
+        f"trades={state['trades']} "
+        f"cost_deployed=R{ghost_exposure_cost(state):.2f} {sast_str()}")
+
+
+def run_cycle(ex, state, signal):
+    if os.path.exists(LIQUIDATE_FILE) or os.path.exists(LIQUIDATE_INPROGRESS):
+        ok = liquidate_all(ex, state, claim=True)
+        sys.exit(0 if ok else 4)
+
+    ex.clear_caches()
+
+    snapshot = build_snapshot(ex, state)
+    nav = snapshot["nav"]
+    state["last_nav"] = nav
+    state["peak_nav"] = max(state.get("peak_nav", 0.0), nav)
+    write_heartbeat(nav, snapshot["nav_stale"], snapshot["nav_unknown"])
+    _log_state_line(state, snapshot, nav)
+
+    if snapshot["nav_unknown"]:
+        log("NAV UNKNOWN (unpriced holding) - refusing to trade.",
+            logging.WARNING)
+        return
+
+    tickers = ex.all_tickers()
+    safe = apex_universe(tickers)
+
+    if not in_session():
+        _handle_session_close(ex, state, snapshot)
+        log(f"SESSION CLOSED ({sast_str()}) - outside US window.")
+        save_state(state)
+        return
+
+    halted = os.path.exists(HALT_FILE)
+    if halted:
+        log("HALT present - new entries blocked, exits and session close "
+            "still active. Touch LIQUIDATE to exit to ZAR.")
+
+    if not safe:
+        log("No MSTRx/STRCx in Luno universe - sleeping. NO BTC BUY.")
+        notify("APEX: no MSTRx/STRCx tickers - sleeping, NO BTC BUY.",
+               key="no-universe", min_gap_seconds=14400)
+        return
+
+    halted_dd = _drawdown_halted(state, nav)
+    if halted_dd:
+        log("Drawdown halt active - entries blocked, exits allowed.")
+
+    for pair in (PAIR, STRC_PAIR):
+        leg = snapshot["legs"][pair]
+        base = pair.split("_")[0]
+        beta = BETA_MSTR if base.startswith("MSTR") else BETA_STRC
+        in_pos = leg["total"] > 0
+
+        if isinstance(signal, SmaCrossSignal):
+            try:
+                raw = ex.candles(pair, duration=CANDLE_SECONDS,
+                                 count=signal.min_bars() + 20)
+                candles = [normalize_candle(c) for c in raw]
+                candles = [c for c in candles if c]
+            except DataUnavailable as e:
+                log(f"{pair}: candles unavailable ({e}) - HOLD",
+                    logging.WARNING)
+                continue
+            entry_px = float(state.get("positions", {}).get(pair, {})
+                             .get("entry_price") or 0.0)
+            d = signal.decide(candles, in_pos, entry_px)
+            log(f"{pair} smacross -> {d.action} : {d.reason}")
+        else:
+            us_move = fetch_us_momentum(base)
+            if us_move is None:
+                log(f"{pair}: US momentum unavailable - HOLD")
+                continue
+            size_probe = min(GHOST_MAX_TRADE_ZAR,
+                             max(MIN_TRADE_ZAR, snapshot["zar"]["free"]))
+            gate_pct, gate_break = compute_gate_pct(ex, pair, snapshot,
+                                                    size_probe)
+            d = signal.decide(us_move, beta, gate_pct, in_pos)
+            log(f"{pair} us_move={us_move * 100:+.2f}% beta={beta} "
+                f"expected={d.expected_pct:.2f}% gate={gate_pct:.2f}% "
+                f"(fee={gate_break['fee_pct']:.2f} "
+                f"spread={gate_break['spread_pct']:.2f} "
+                f"impact_in={gate_break['impact_in']:.2f} "
+                f"impact_out={gate_break['impact_out']:.2f}) "
+                f"-> {d.action} : {d.reason}")
+
+        cooldown = state.get("cooldown_until", {}).get(pair, 0)
+        if d.action == "BUY" and cooldown > time.time():
+            log(f"BLOCKED BUY {pair}: cooling {cooldown - time.time():.0f}s")
+            continue
+
+        if d.action == "BUY":
+            if halted:
+                log(f"BUY {pair} blocked by HALT")
+                continue
+            if halted_dd:
+                log(f"BUY {pair} blocked by drawdown halt")
+                continue
+            plan = plan_trade(ex, "BUY", pair, snapshot, state)
+            if "blocked" in plan:
+                log(f"BLOCKED BUY {pair}: {plan['blocked']}")
+            elif not plan["exit_complete"]:
+                log(f"BLOCKED BUY {pair}: bid side cannot absorb exit")
+            else:
+                execute(ex, state, "BUY", pair, plan, d.reason)
+        elif d.action == "SELL":
+            plan = plan_trade(ex, "SELL", pair, snapshot, state)
+            if "blocked" in plan:
+                log(f"BLOCKED SELL {pair}: {plan['blocked']}")
+            elif not plan["exit_complete"]:
+                log(f"BLOCKED SELL {pair}: book too thin", logging.ERROR)
+                notify(f"APEX: SELL blocked on {pair} - book too thin.",
+                       key=f"sell-blocked-{pair}", min_gap_seconds=1800)
+            else:
+                execute(ex, state, "SELL", pair, plan, d.reason)
+
+    if PARK_IN_STRC:
+        _maybe_park_in_strc(ex, state, snapshot)
+
+    if time.time() - state["last_heartbeat_ts"] > HEARTBEAT_HOURS * 3600:
+        notify(f"APEX {MODE} alive - NAV R{nav:,.2f} "
+               f"{'[STALE]' if snapshot['nav_stale'] else ''} "
+               f"deployed cost=R{ghost_exposure_cost(state):.2f}/"
+               f"R{GHOST_ALLOCATION_ZAR:.2f} "
+               f"mark=R{ghost_exposure_mark(snapshot):.2f} "
+               f"trades {state['trades']}")
+        state["last_heartbeat_ts"] = time.time()
+
+
+def _maybe_park_in_strc(ex, state, snapshot):
+    mstr_leg = snapshot["legs"][PAIR]
+    strc_leg = snapshot["legs"][STRC_PAIR]
+    if mstr_leg["total"] > 0 or strc_leg["total"] > 0:
+        return
+    us_strc = fetch_us_momentum("STRCx")
+    if us_strc is None or us_strc < 0:
+        return
+    plan = plan_trade(ex, "BUY", STRC_PAIR, snapshot, state)
+    if "blocked" in plan:
+        log(f"park: STRCx BUY blocked: {plan['blocked']}")
+        return
+    execute(ex, state, "BUY", STRC_PAIR, plan, f"park (STRC {us_strc:+.2%})")
+
+
+# ------------------------------------------------------------ telemetry ---
+def cmd_audit(args):
+    rows = read_fills()
+    now = time.time()
+    since = now - args.days * 86400
+    window = []
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(
+                r["ts"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if ts >= since:
+            window.append((ts, r))
+    window.sort(key=lambda x: x[0])
+
+    buys = [(ts, r) for ts, r in window if r.get("action") == "BUY"]
+    sells = [(ts, r) for ts, r in window
+             if r.get("action") == "SELL" and "pnl_zar" in r]
+    wins = [r for _, r in sells if float(r.get("pnl_zar", 0)) > 0]
+    losses = [r for _, r in sells if float(r.get("pnl_zar", 0)) < 0]
+    win_pnls = [float(r["pnl_zar"]) for r in wins]
+    loss_pnls = [float(r["pnl_zar"]) for r in losses]
+    all_pnls = win_pnls + loss_pnls
+    total_fees = sum(float(r.get("fee_zar", 0) or 0) for _, r in window)
+    realized = sum(all_pnls)
+
+    session_days = set()
+    for ts, _ in window:
+        session_days.add(datetime.fromtimestamp(
+            ts, timezone.utc).strftime("%Y-%m-%d"))
+
+    print("=" * 60)
+    print(f"APEX AUDIT   last {args.days:.1f} days   ({sast_str()})")
+    print(f"Mode at read time: {MODE}")
+    print("-" * 60)
+    print(f"Total fills (BUY+SELL): {len(window)}")
+    print(f"Buys : {len(buys)}")
+    print(f"Sells: {len(sells)}")
+    if session_days:
+        print(f"Active days: {len(session_days)}   "
+              f"Trades/day (buys+sells): "
+              f"{len(window) / max(1, len(session_days)):.2f}")
+    print("-" * 60)
+    print(f"Round trips (closed sells): {len(sells)}")
+    if sells:
+        print(f"Win rate        : {len(wins) / len(sells) * 100:.1f}%")
+        print(f"Avg win (net)   : "
+              f"R{(statistics.mean(win_pnls) if win_pnls else 0):+.2f}")
+        print(f"Avg loss (net)  : "
+              f"R{(statistics.mean(loss_pnls) if loss_pnls else 0):+.2f}")
+        print(f"Largest win     : "
+              f"R{(max(win_pnls) if win_pnls else 0):+.2f}")
+        print(f"Largest loss    : "
+              f"R{(min(loss_pnls) if loss_pnls else 0):+.2f}")
+    print(f"Realized net    : R{realized:+.2f}")
+    print(f"Fees paid       : R{total_fees:.2f}")
+    print(f"Gross before fees: R{realized + total_fees:+.2f}")
+    print("-" * 60)
+    if not window:
+        print("VERDICT: no activity in window.")
+        print("If the market was volatile and the bot did nothing, that is")
+        print("a bug. If the market was flat, this is correct behaviour.")
+    elif len(sells) == 0:
+        print("VERDICT: buys only, no closed trades.")
+    else:
+        wr = len(wins) / len(sells) * 100
+        if loss_pnls and sum(loss_pnls) != 0:
+            pf = sum(win_pnls) / abs(sum(loss_pnls))
+            print(f"VERDICT: win rate {wr:.1f}%, profit factor {pf:.2f}")
+        else:
+            print(f"VERDICT: win rate {wr:.1f}%, no losses in window")
+        if realized > 0:
+            print("Net positive. Bot is harvesting.")
+        elif realized == 0:
+            print("Net flat. Fees offsetting gross. Consider tighter gate.")
+        else:
+            print("Net negative. Fees or adverse selection. Investigate.")
+    print("=" * 60)
+    return 0
+
+
+# -------------------------------------------------------- daily report ---
+def cmd_daily_report(args):
+    state = load_state()
+    now = time.time()
+    since = now - args.hours * 3600
+
+    try:
+        with open(HEARTBEAT_FILE) as f:
+            hb = json.load(f)
+        hb_age = now - float(hb.get("epoch", 0))
+        hb_ok = hb_age < args.max_age
+    except Exception:
+        hb, hb_age, hb_ok = {}, float("inf"), False
+
+    rows = read_fills()
+    trades = []
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(
+                r["ts"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if ts >= since:
+            trades.append(r)
+    trades.sort(key=lambda r: r.get("ts", ""))
+
+    buys = [t for t in trades if t.get("action") == "BUY"]
+    sells = [t for t in trades
+             if t.get("action") == "SELL" and "pnl_zar" in t]
+    realized_window = sum(float(t.get("pnl_zar", 0)) for t in sells)
+    fees_window = sum(float(t.get("fee_zar", 0) or 0) for t in trades)
+
+    realized_total = sum(float(r.get("pnl_zar", 0))
+                         for r in rows
+                         if r.get("action") == "SELL" and "pnl_zar" in r)
+
+    nav_now = hb.get("nav_zar", state.get("last_nav", 0))
+    nav_prev = float(state.get("_last_daily_nav") or 0.0)
+    nav_delta = nav_now - nav_prev if nav_prev else 0.0
+
+    warns = []
+    if not hb_ok:
+        warns.append(f"heartbeat {hb_age/60:.0f}m stale")
+    if hb.get("nav_stale"):
+        warns.append("NAV stale")
+    if hb.get("nav_unknown"):
+        warns.append("NAV unknown")
+    if state.get("consecutive_errors", 0) > 0:
+        warns.append(f"errors: {state['consecutive_errors']}")
+    if os.path.exists(HALT_FILE):
+        warns.append("HALT present")
+
+    deployed = ghost_exposure_cost(state)
+    lines = [
+        f"APEX DAILY {sast_str()}",
+        f"mode: {MODE}   session: "
+        f"{'OPEN' if in_session() else 'CLOSED'}",
+        f"status: {'ALIVE' if hb_ok else 'STALE'} "
+        f"(hb {hb_age/60:.0f}m old)",
+        "",
+        f"NAV: R{nav_now:.2f}"
+        + (f"  ({nav_delta:+.2f} vs last report)" if nav_prev else ""),
+        f"Ghost deployed: R{deployed:.2f} / R{GHOST_ALLOCATION_ZAR:.2f}",
+        "",
+        f"Last {args.hours:.0f}h: {len(buys)} buys, {len(sells)} sells",
+        f"Realized P&L (window): R{realized_window:+.2f}",
+        f"Realized P&L (all time): R{realized_total:+.2f}",
+        f"Fees paid (window): R{fees_window:.2f}",
+    ]
+
+    if trades:
+        lines.append("")
+        lines.append("Recent fills:")
+        for t in trades[-8:]:
+            ts_short = (t.get("ts", "")[11:19] or "?")
+            side = t.get("action", "?")
+            pair = t.get("pair", "?")
+            px = float(t.get("vwap", 0) or 0)
+            extra = ""
+            if side == "SELL" and "pnl_zar" in t:
+                extra = f"  pnl R{float(t['pnl_zar']):+.2f}"
+            lines.append(f"  {ts_short} {side:4} {pair:14} @ {px:.2f}{extra}")
+    else:
+        lines.append("")
+        lines.append("No fills in window. Gate not cleared.")
+
+    if warns:
+        lines.append("")
+        lines.append("WARN: " + " | ".join(warns))
+
+    msg = "\n".join(lines)
+    notify(msg)
+    print(msg)
+
+    state["_last_daily_nav"] = nav_now
+    save_state(state)
+    return 0
+
+
+# ------------------------------------------------------------- watchdog ---
+def cmd_watchdog(args):
+    rc = 0
+    try:
+        with open(HEARTBEAT_FILE) as f:
+            hb = json.load(f)
+    except Exception as e:
+        notify(f"APEX WATCHDOG: no readable heartbeat ({e}).")
+        log(f"watchdog: heartbeat unreadable: {e}", logging.ERROR)
+        return 1
+    age = time.time() - float(hb.get("epoch", 0))
+    if age > args.max_age:
+        notify(f"APEX WATCHDOG: heartbeat {age / 60:.0f} min old "
+               f"(limit {args.max_age / 60:.0f}). NAV was R{hb.get('nav_zar')}.")
+        log(f"watchdog: stale heartbeat {age:.0f}s", logging.ERROR)
+        rc = 1
+    if hb.get("nav_stale"):
+        notify("APEX WATCHDOG: NAV STALE - price feed down.",
+               key="wd-stale", min_gap_seconds=3600)
+    if hb.get("nav_unknown"):
+        notify("APEX WATCHDOG: NAV UNKNOWN - unpriced holding.",
+               key="wd-unknown", min_gap_seconds=3600)
+
+    rows = read_receipts()
+    cutoff = time.time() - args.receipt_grace_days * 86400
+    stale = []
+    for r in rows:
+        if r.get("mode") != "LIVE":
+            continue
+        if r.get("withdrawn_to_bank"):
+            continue
+        if (r.get("realized_zar") or 0) <= 0:
+            continue
+        try:
+            ts = datetime.fromisoformat(
+                r["ts"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if ts < cutoff:
+            stale.append(r["trade_id"])
+    if stale:
+        notify(f"APEX WATCHDOG: {len(stale)} realized LIVE trades have not "
+               f"been marked withdrawn in >{args.receipt_grace_days}d. "
+               f"Ghost Law 3 chain incomplete. IDs: {stale[:5]}",
+               key="wd-receipts", min_gap_seconds=86400)
+        rc = 1
+
+    print(f"watchdog: hb {age:.0f}s old, nav R{hb.get('nav_zar')}, "
+          f"stale_receipts={len(stale)}")
+    return rc
+
+
+# ---------------------------------------------------------------- status ---
+def cmd_status(args):
+    state = load_state()
+    try:
+        with open(HEARTBEAT_FILE) as f:
+            hb = json.load(f)
+    except Exception:
+        hb = {}
+    print("=" * 60)
+    print(f"APEX V11.5 STATUS   mode={MODE}   {sast_str()}   "
+          f"session={'OPEN' if in_session() else 'CLOSED'}")
+    print(f"Session window  : {SESSION_START}-{SESSION_END} SAST "
+          f"(US summer; +1h in US winter)")
+    print(f"HALT            : "
+          f"{'present' if os.path.exists(HALT_FILE) else 'absent'} "
+          f"(blocks entries only)")
+    print(f"Ghost allocation: R{GHOST_ALLOCATION_ZAR:.2f} "
+          f"max trade R{GHOST_MAX_TRADE_ZAR:.2f}")
+    print(f"Ghost cost deployed: R{ghost_exposure_cost(state):.2f}")
+    print("-" * 60)
+    nav = hb.get("nav_zar", state.get("last_nav", 0))
+    print(f"NAV              : R{nav:.2f}")
+    pb = state.get("paper_balances", {})
+    if pb:
+        print(f"Paper ZAR        : R{pb.get('ZAR', {}).get('total', 0):.2f}")
+        for pair in (PAIR, STRC_PAIR):
+            base = pair.split("_")[0].upper()
+            held = pb.get(base, {})
+            print(f"Paper {base:<10}: {held.get('total', 0):.8f}")
+    print(f"Trades           : {state.get('trades', 0)}")
+    print(f"Peak NAV         : R{state.get('peak_nav', 0):.2f}")
+    print(f"Consecutive errs : {state.get('consecutive_errors', 0)}")
+    print("-" * 60)
+    realized = 0.0
+    fills = 0
+    for r in read_fills():
+        if r.get("action") == "SELL" and "pnl_zar" in r:
+            realized += float(r["pnl_zar"])
+            fills += 1
+    print(f"Realized P/L     : R{realized:+.2f} ({fills} closed trades)")
+    receipts = read_receipts()
+    live = [r for r in receipts if r.get("mode") == "LIVE"]
+    pending = [r for r in live
+               if not r.get("withdrawn_to_bank")
+               and (r.get("realized_zar") or 0) > 0]
+    withdrawn = [r for r in live if r.get("withdrawn_to_bank")]
+    print(f"Live receipts    : {len(live)} total, "
+          f"{len(pending)} pending, {len(withdrawn)} withdrawn")
+    print("=" * 60)
+    return 0
+
+
+def cmd_reset_paper(args):
+    state = load_state()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup = STATE_FILE + f".bak.{stamp}"
+    try:
+        with open(STATE_FILE) as src, open(backup, "w") as dst:
+            dst.write(src.read())
+        print(f"backup -> {backup}")
+    except FileNotFoundError:
+        pass
+    old = state.get("paper_balances", {}).get("ZAR", {}).get("total", 0)
+    state["paper_balances"] = {"ZAR": {"total": args.zar, "free": args.zar}}
+    state["peak_nav"] = args.zar
+    state["last_nav"] = args.zar
+    state["positions"] = {}
+    state["ghost_cost_deployed"] = 0.0
+    state["session_close_done"] = {}
+    save_state(state)
+    print(f"reset paper ZAR R{old:.2f} -> R{args.zar:.2f}")
+    print("(order_seq, boot_id, trades, paper_seen_orders preserved)")
+    return 0
+
+
+def cmd_mark_withdrawn(args):
+    rows = read_receipts()
+    if not rows:
+        print("no receipts file or empty")
+        return 1
+    found = False
+    for r in rows:
+        if r.get("trade_id") == args.trade_id:
+            r["withdrawn_to_bank"] = True
+            r["bank_reference"] = args.bank_ref
+            if args.receipt:
+                r["receipt_photo"] = args.receipt
+            r["withdrawn_at"] = datetime.now(timezone.utc).isoformat()
+            found = True
+    if not found:
+        print(f"trade_id {args.trade_id} not found")
+        return 1
+    tmp = RECEIPTS_FILE + ".tmp"
+    with _flock(RECEIPTS_FILE):
+        with open(tmp, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        os.replace(tmp, RECEIPTS_FILE)
+    print(f"marked {args.trade_id} withdrawn "
+          f"(bank_ref={args.bank_ref}, receipt={args.receipt})")
+    return 0
+
+
+# ------------------------------------------------------------------ init ---
+DEPLOY_FILES = {
+    "requirements.txt": "luno_python==0.0.10\nrequests\n",
+    ".env.example": """# APEX V11.5 defaults.
+APEX_MODE=PAPER
+LUNO_KEY_ID=
+LUNO_SECRET=
+TELEGRAM_TOKEN=
+TELEGRAM_CHAT_ID=
+MSTR_PAIR=MSTRx_ZAR
+STRC_PAIR=STRCx_ZAR
+
+# Ghost capital - single lever. R100 to R100,000+.
+APEX_GHOST_ALLOCATION_ZAR=100
+APEX_GHOST_MAX_TRADE_ZAR=100
+APEX_MIN_TRADE_ZAR=10
+APEX_PAPER_STARTING_ZAR=100
+APEX_PAPER_FEE_PCT=0.75
+
+# Signal
+APEX_SIGNAL=fee_momentum
+APEX_BETA_MSTR=1.7
+APEX_BETA_STRC=0.3
+APEX_FEE_BREAKEVEN_PCT=0.7
+APEX_PARK_IN_STRC=0
+
+# Session gate (SAST).
+# US SUMMER (Mar-Nov): 15:30-22:00 SAST = 09:30-16:00 EDT.
+# US WINTER (Nov-Mar): 16:30-23:00 SAST = 09:30-16:00 EST.
+APEX_SESSION_ENFORCE=1
+APEX_SESSION_START_SAST=15:30
+APEX_SESSION_END_SAST=22:00
+# APEX_SESSION_START_SAST=16:30
+# APEX_SESSION_END_SAST=23:00
+
+# Loop
+APEX_LOOP_SECONDS=14400
+""",
+    "PYTHONANYWHERE.md": """# APEX deployment on PythonAnywhere
+
+## Scheduled tasks (times UTC)
+Task 1 - hourly trading cycle:
+    cd /home/YOURUSER && python3 apex.py once
+
+Task 2 - daily Telegram digest, 21:30 UTC = 23:30 SAST:
+    cd /home/YOURUSER && python3 apex.py daily-report --hours 24
+
+Task 3 - weekly audit (Sunday 19:00 UTC):
+    cd /home/YOURUSER && python3 apex.py audit --days 7
+
+## Files
+apex_state.json, apex_fills.jsonl, apex_receipts.jsonl,
+apex_heartbeat.json, apex.log
+
+## Kill switches
+touch HALT       - blocks new entries, keeps exits + session close
+touch LIQUIDATE  - sell all to ZAR, then disable trading
+""",
+}
+
+
+def cmd_init():
+    target = "apex_deploy"
+    os.makedirs(target, exist_ok=True)
+    for name, content in DEPLOY_FILES.items():
+        path = os.path.join(target, name)
+        with open(path, "w") as f:
+            f.write(content)
+        print(f"wrote {path}")
+    print("\nNext: copy .env.example to ~/Set-Env-PRISTINE.sh, fill in keys, "
+          "then `python3 apex.py status`.")
+
+
+# ------------------------------------------------------------------ main ---
+def main():
+    p = argparse.ArgumentParser(description="APEX V11.5 Canonical")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="write deployment files")
+    sub.add_parser("run", help="continuous loop")
+    sub.add_parser("once", help="single cycle (scheduled tasks)")
+    sub.add_parser("liquidate", help="sell all legs to ZAR")
+    sub.add_parser("status", help="show NAV, P/L, receipts")
+
+    rp = sub.add_parser("reset-paper", help="reset paper ZAR, keep history")
+    rp.add_argument("--zar", type=float, default=100.0)
+
+    mw = sub.add_parser("mark-withdrawn",
+                        help="mark a realized LIVE trade as withdrawn")
+    mw.add_argument("trade_id")
+    mw.add_argument("--bank-ref", default=None)
+    mw.add_argument("--receipt", default=None, help="photo path or URL")
+
+    wd = sub.add_parser("watchdog", help="heartbeat + stale receipts check")
+    wd.add_argument("--max-age", type=float, default=12 * 3600 + 600)
+    wd.add_argument("--receipt-grace-days", type=float, default=7.0)
+
+    dr = sub.add_parser("daily-report",
+                        help="send daily digest to Telegram")
+    dr.add_argument("--hours", type=float, default=24.0)
+    dr.add_argument("--max-age", type=float, default=6 * 3600)
+
+    au = sub.add_parser("audit",
+                        help="predator telemetry from apex_fills.jsonl")
+    au.add_argument("--days", type=float, default=7.0)
+
+    args = p.parse_args()
+
+    if args.cmd == "init":
+        cmd_init()
+        return
+    if args.cmd == "status":
+        sys.exit(cmd_status(args))
+    if args.cmd == "reset-paper":
+        sys.exit(cmd_reset_paper(args))
+    if args.cmd == "mark-withdrawn":
+        sys.exit(cmd_mark_withdrawn(args))
+    if args.cmd == "watchdog":
+        sys.exit(cmd_watchdog(args))
+    if args.cmd == "daily-report":
+        sys.exit(cmd_daily_report(args))
+    if args.cmd == "audit":
+        sys.exit(cmd_audit(args))
+
+    state = load_state()
+
+    if os.path.exists(LIQUIDATE_INPROGRESS) and args.cmd != "liquidate":
+        log("LIQUIDATE.inprogress present - refusing to start.",
+            logging.ERROR)
+        notify("APEX: refusing to start; LIQUIDATE.inprogress present.")
+        sys.exit(5)
+    if os.path.exists(LIQUIDATE_DONE) and args.cmd != "liquidate":
+        log("LIQUIDATE.done present - trading disabled.", logging.WARNING)
+        sys.exit(0)
+
+    ex = Exchange(state=state)
+
+    if args.cmd == "liquidate":
+        ok = liquidate_all(ex, state, claim=True)
+        sys.exit(0 if ok else 4)
+
+    try:
+        signal = build_signal(SIGNAL_NAME)
+    except ApexError as e:
+        log(f"signal config error: {e}", logging.ERROR)
+        sys.exit(2)
+
+    log(f"Session window: {SESSION_START}-{SESSION_END} SAST "
+        f"(US summer; if running Nov-Mar, set APEX_SESSION_START_SAST=16:30 "
+        f"APEX_SESSION_END_SAST=23:00)")
+    log(f"=== APEX V11.5 START mode={MODE} "
+        f"pairs={PAIR},{STRC_PAIR} signal={signal.name} "
+        f"ghost=R{GHOST_ALLOCATION_ZAR:.2f} "
+        f"cost_deployed=R{state.get('ghost_cost_deployed', 0):.2f} "
+        f"cmd={args.cmd} ===")
+    if MODE == "LIVE":
+        notify(f"APEX V11.5 LIVE started - {PAIR}/{STRC_PAIR} - "
+               f"ghost R{GHOST_ALLOCATION_ZAR:.2f} "
+               f"max R{GHOST_MAX_TRADE_ZAR:.2f}/trade")
+    else:
+        log(f"PAPER mode. Starting ZAR R{PAPER_STARTING_ZAR:.2f}. "
+            f"Set APEX_MODE=LIVE to trade real.")
+
+    if args.cmd == "once":
+        try:
+            run_cycle(ex, state, signal)
+            state["consecutive_errors"] = 0
+            save_state(state)
+        except SystemExit:
+            raise
+        except Exception as e:
+            state["consecutive_errors"] = \
+                state.get("consecutive_errors", 0) + 1
+            log(f"CYCLE ERROR #{state['consecutive_errors']}: "
+                f"{type(e).__name__}: {e}", logging.ERROR)
+            save_state(state)
+            if state["consecutive_errors"] >= ALERT_AFTER_ERRORS:
+                notify(f"APEX ERROR x{state['consecutive_errors']}: "
+                       f"{type(e).__name__}: {str(e)[:300]}")
+            sys.exit(1)
+        return
+
+    backoff = 60
+    while True:
+        try:
+            run_cycle(ex, state, signal)
+            state["consecutive_errors"] = 0
+            backoff = 60
+            save_state(state)
+            time.sleep(LOOP_SECONDS)
+        except KeyboardInterrupt:
+            log("interrupted - exiting")
+            save_state(state)
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            state["consecutive_errors"] = \
+                state.get("consecutive_errors", 0) + 1
+            log(f"CYCLE ERROR #{state['consecutive_errors']}: "
+                f"{type(e).__name__}: {e}", logging.ERROR)
+            if state["consecutive_errors"] >= ALERT_AFTER_ERRORS:
+                notify(f"APEX ERROR x{state['consecutive_errors']}: "
+                       f"{type(e).__name__}: {str(e)[:300]}",
+                       key="cycle-error", min_gap_seconds=1800)
+            try:
+                save_state(state)
+            except OSError:
+                pass
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 3600)
+
+
+if __name__ == "__main__":
+    main()
