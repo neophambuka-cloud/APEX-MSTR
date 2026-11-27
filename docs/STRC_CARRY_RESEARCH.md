@@ -1,30 +1,35 @@
-# STRC carry research — NOT an executable trade plan
+# STRC token carry research — small, testable economics experiment
 
-## Primary constraint
-STRC's 12% rate is a variable annualized dividend rate on $100 stated value, not a guaranteed yield on market cost. It may change; a holder must be entitled to actual cash distributions. VALR xStocks token holders do NOT have guaranteed dividend rights or even guaranteed issuer rebase benefits. Verify whether STRC is actually available on VALR, as what exact product, and document issuer corporate-action policy before using a yield assumption.
+## Working route (no cash dividend required)
+Borrow asset B -> sell/convert to STRC token -> accrue new tokens or receive rebase (verify actual credited quantity on VALR) -> sell new tokens when liquid -> convert proceeds to ZAR -> service loan -> track net gain/loss.
 
-## Observed indications (screenshots 2026-11-27)
-Estimated variable VALR borrow rates: BTC 1.37%; ETH 0.62%; USDT 11.14%; USDC 12.71%. These are not fixed funding quotes, and exclude the VALR 0.5% upfront borrowing fee and execution costs.
+What matters is units accrued × achievable sell price, not whether distribution is legally called a dividend. Measure credited token quantities and executable ZAR conversion; do not make product terminology a bottleneck. Account history is the evidence gate for the exact STRC token accrual mechanism.
 
-## Core model — borrowed asset B, share cashflows USD
-Let N_B = quantity borrowed; P_BUSD(t) = USD price of borrowed asset; r_B(t) = variable interest; F_B = origination fees in B; D_USD(t) = cash distributions actually received on owned eligible STRC shares after withholding/tax; P_STRC(t) = share price; C(t) = all conversion, brokerage, custody, hedge and financing costs.
+## Screenshot financing inputs (27 November 2026)
+Estimated variable VALR borrowing rates: BTC 1.37%; ETH 0.62%; USDT 11.14%; USDC 12.71%. Annualized estimates, not locked borrowing terms. VALR origination fee observed in published schedule as 0.5%; verify actual rounding and fee impacts at tiny size.
 
-Final USD profit = market value of STRC + cumulative dividends + residual cash
-                   - value of B liability (principal + accrued interest + fees)
-                   - all other costs - initial invested capital (properly financed).
+## Full symmetric BTC-debt scenario
+Borrow 1 BTC notionally worth $10,000; convert all proceeds to STRC, assume $1,200 realized value of additional credited tokens after 1 year, STRC original market value unchanged, 1.37% simple annual BTC interest, 0.5% BTC origination fee, no other costs. Debt at end: 1.0187 BTC.
+```
+Profit USD = 11,200 - 10,187 * (BTC_end_USD / BTC_start_USD)
+BTC -50%: +6,106.50
+BTC -30%: +4,069.10
+BTC   0%: +1,013.00
+BTC +30%: -2,043.10
+BTC +50%: -4,080.50
+Break-even BTC price appreciation: approximately 9.94%.
+```
+For this short-BTC liability structure, BTC falling can amplify profits while BTC rising can wipe out the yield spread. This is directional speculation plus a carry stream, not risk-free arbitrage.
 
-If borrow BTC/ETH and immediately sell to USD for STRC, the liability is short BTC/ETH. BTC/ETH appreciation can swamp the 12% distribution. A hedge is not free: its basis/funding/counterparty collateral and liquidation risk must be modelled. If borrow USDT/USDC directly, screenshot rates are near or above STRC headline dividend before fees.
+## Compact executable test plan
+1. Identify actual VALR STRC token symbol and record a pair of balances across a credited-token event, adjusted for trades; never assume credits exist until observed.
+2. Calculate STRC yield as **credited tokens × executable bid price** rather than dividend label or advertised headline rate.
+3. Build deterministic round-trip examples: borrow BTC/ETH/USDT, convert to token, accrue, sell tokens, convert proceeds to debt unit and ZAR, repay loan; every leg has spread, fee, latency and slippage.
+4. Stress BTC/ETH both down and up by 10/30/50/100%, STRC price +/-20%, accrual curtailed, credit cost jumps, haircut and liquidation changes. Include BTC/ZAR and USD/ZAR exposures separately.
+5. Compute net P&L and path-dependent liquidation risk under actual collateral composition. Separately compare with unlevered STRC token accumulation.
+6. Never enable real borrowing, liquidation experiments or live execution through this research code. Unknown parameters become sensitivity intervals or documented validation tasks; they do not block MSTR market observation work.
 
-## Minimum gating checks
-1. Obtain exact STRC instrument on VALR and whether it is an actual share, xStock, derivative or not listed.
-2. Verify transferable asset/withdrawal path to brokerage where STRC cash distributions legally accrue.
-3. Collect actual borrowing APR history, borrowing currency, hourly auction regime, origination fees, minimums, fees on repayment, compulsory liquidation triggers and collateral weights.
-4. Model 24+ month downside: BTC +100% vs USD while STRC price -20%; dividend rate reduced; funding APR spikes; collateral haircut changes; FX and exchange interruptions.
-5. Calculate after-tax USD and ZAR returns, maximum cash deficit and survival without selling permanent BTC.
-6. Compare alternatives: unsecured asset-level debt, direct USD finance, unlevered STRC, reserve-funded deployment, and fixed-rate borrowing.
-Decision threshold: no deployment unless verified after-cost risk-adjusted benefit is positive AND stress-case solvency survives; otherwise do nothing.
-
-Sources:
+Useful documentation:
 https://www.strategy.com/strc/learn
 https://support.valr.com/hc/en-us/articles/21439426222492-What-are-xStocks
 https://support.valr.com/hc/en-us/articles/21462249717276-VALR-Tokenised-Stocks-Terms-of-Service
