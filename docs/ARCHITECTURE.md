@@ -1,7 +1,7 @@
 # APEX foundation / staged construction
 
 ## Mandate
-MSTR is the research target. Data sources can include US-listed MSTR, BTC spot, MSTR perps on VALR, Strategy capital structure, market hours and news events. Execution is a separately gated function.
+MSTR is the sole trading target. Data sources can include US-listed MSTR, BTC price as a predictive input, MSTR perps on VALR, Strategy capital structure, market hours and news events. No STRC or crypto borrowing/accumulation strategies belong in this project. Execution is separately gated.
 
 ```
 External sources -> normalised UTC event ledger -> quality gate -> feature builder
@@ -10,7 +10,7 @@ External sources -> normalised UTC event ledger -> quality gate -> feature build
 ```
 
 ## Phases and evidence gates
-- F0 inventory: inspect existing code and confirm exact VALR MSTR perps symbol, public API support, corporate-action/STRC token status and legal access.
+- F0 inventory: inspect existing code and confirm exact VALR MSTR perps symbol, public API support, market-data rights and legal access.
 - F1 observation: timestamped, deduplicated, persisted public data; reconnect/replay tests; stale feed triggers no trade.
 - F2 economics: fee tables by instrument and timestamp, hourly funding, spread, slippage, FX, conversion, market-closed pricing and interest accrual. Negative-expectation configurations rejected.
 - F3 hypotheses: walk-forward experiments on BTC lead/lag, perp basis/funding and MSTR dislocation; account for US market holidays, time-zone/DST, news gaps, multiple testing.
@@ -23,7 +23,7 @@ product_type, base_currency, quote_currency, bid, ask, mark, index, last, size, 
 open_interest, session_state, raw_payload_hash, quality_flags.
 
 ## Invariants
-- Separate spot, tokenised stock, perp, borrowed currency, collateral, and actual listed share.
+- Distinguish underlying MSTR listed shares from MSTR perpetual derivatives, and USDC margin from equity exposure; BTC is observational data only.
 - Perp price is not necessarily MSTR NASDAQ price; stale underlying prices during closure cannot be treated as arbitrage.
 - Position reconciliations require source snapshots and historical fills. Borrowing interest and fees are liabilities.
 - No strategy can override execution-risk protections. No automatic self-modification of deployed trading logic.
