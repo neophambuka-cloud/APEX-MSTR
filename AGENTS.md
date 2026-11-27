@@ -7,7 +7,7 @@ Objective: Build an MSTR-specialist market intelligence and selective execution 
 - Read-only by default. All real trading, margin borrowing, key provisioning, withdrawals and leverage are explicitly OUT OF SCOPE until separately authorised.
 - Never store API keys/secrets in git, logs, issues or example files.
 - Do not invent or hardcode exchange instrument IDs, fees, liquidation thresholds, dividend entitlements, trading hours or API response shapes. Discover, verify and record sources.
-- No assumption that tokenised STRC earns STRC cash dividends. Treat underlying ownership, token exposure and derivatives as distinct.
+- For STRC token carry, model the practical route: tokens held -> issuer/venue token credits or rebases (if actually observed) -> sell credited tokens -> convert to ZAR -> repay financing -> measure net proceeds. Cash dividends are NOT a prerequisite for research. Verify token credits and market execution via records without turning legal terminology into an implementation bottleneck. Distinguish product types only where it changes the actual numbers.
 - Use UTC timestamps and record data source, timestamp, market session, unit, quote currency and staleness for every observation.
 - Models must fail closed on missing data, stale data, inconsistent positions, unknown fee schedule or unavailable market.
 - Risk controls exist outside signal models; signal models cannot disable their own risk checks.
