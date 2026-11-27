@@ -1,6 +1,13 @@
 # APEX-MSTR — instructions for Codex
 
-Objective: Build an MSTR-specialist market intelligence and selective execution system. Apex observes more than it trades; no trade is preferable to a weak trade.
+Objective: Build a direction-agnostic MSTR-specialist predator: seek positive net expected returns in rising, falling, and sideways BTC/MSTR markets using the most appropriate validated exposure, or abstain. Apex observes more than it trades; no trade is preferable to a weak trade.
+
+## Apex mandate is independent
+- Do NOT impose Endurance's permanent-Bitcoin ownership thesis, long-only preferences, or investment doctrines on Apex signal selection. Apex is a standalone, tactical trading research system.
+- Evaluate long, short, flat, funding/carry, and BTC-denominated financing paths symmetrically. Falling-price profits and rising-price losses must both be reported, with full capital-at-risk metrics.
+- A scenario payoff table is NOT evidence of historical profitability or a predictive edge. Use available historical data and time-specific financing/token-accrual records before claiming actual profits.
+- "Profit whichever way markets move" is a research objective, not a guarantee. Avoid reversal chasing, overtrading, and an assumption that Apex can foresee regime changes.
+- Maintain independent hard risk controls, fees, liquidation and venue safeguards; profit seeking cannot override insolvency prevention.
 
 ## Standing engineering constraints
 - Work bottom-up. Preserve existing architecture and report conflicts before changing it.
