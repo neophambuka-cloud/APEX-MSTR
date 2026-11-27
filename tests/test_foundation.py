@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from apex_foundation.core import (
-    MarketState, Observation, RiskConfig, gate_entry, estimate_carry_usd,
+    MarketState, Observation, RiskConfig, gate_entry,
 )
 
 
