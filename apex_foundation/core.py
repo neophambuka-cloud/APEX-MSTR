@@ -76,22 +76,3 @@ def gate_entry(
         return RiskDecision(False, "spread_limit")
     return RiskDecision(False, "paper_only_no_live_authorization")
 
-
-def estimate_carry_usd(
-    borrowed_units: Decimal,
-    borrowed_asset_usd_at_start: Decimal,
-    borrowed_asset_usd_at_end: Decimal,
-    apr: Decimal,
-    years: Decimal,
-    cash_distributions_usd: Decimal,
-    other_costs_usd: Decimal,
-    upfront_fee_fraction: Decimal = Decimal("0.005"),
-) -> Decimal:
-    """Simple scenario, not a pricing model. APR as decimal, no compounding or mid-period FX."""
-    if min(borrowed_units, borrowed_asset_usd_at_start, borrowed_asset_usd_at_end, years, other_costs_usd) < 0:
-        raise ValueError("negative input")
-    if apr < 0 or upfront_fee_fraction < 0:
-        raise ValueError("negative borrowing cost")
-    usd_proceeds = borrowed_units * borrowed_asset_usd_at_start
-    debt_end = borrowed_units * (Decimal(1) + upfront_fee_fraction + apr * years) * borrowed_asset_usd_at_end
-    return usd_proceeds + cash_distributions_usd - debt_end - other_costs_usd
