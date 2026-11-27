@@ -34,3 +34,7 @@ Objective: Build a direction-agnostic MSTR-specialist predator: seek positive ne
 
 ## Pull request acceptance
 Every PR must state what is verified, assumed, unverified and intentionally excluded; include tests and a rollback path. Never assert profitability from an untested spread.
+
+## Mandatory quality gates
+- Follow docs/EXECUTION_PLAN.md in gate order. Complete each gate with evidence, tests, PASS/FAIL and exactly one next step.
+- Follow docs/REASONING_QA.md before any report, chart, strategy assessment, or PR. Payoff symmetry, scenario arithmetic reconciliation and the distinction between hypothetical and executable returns are required.
