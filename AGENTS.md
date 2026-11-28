@@ -38,3 +38,10 @@ Every PR must state what is verified, assumed, unverified and intentionally excl
 ## Mandatory quality gates
 - Follow docs/EXECUTION_PLAN.md in gate order. Complete each gate with evidence, tests, PASS/FAIL and exactly one next step.
 - Follow docs/REASONING_QA.md and docs/REVIEW_PROTOCOL.md before any report, chart, strategy assessment, or PR. Require blue-team functional tests, independent red-team adversarial tests and a separately recorded Claude review prior to promotion. Never claim Claude reviewed until its actual report is attached.
+
+## Evidence-first safety invariant (mandatory)
+- Apex's design cannot rely on plausible explanations or unverified exchange behavior. Every execution-critical claim requires a traceable primary source, independently reproducible observation or account/exchange event log, timestamp and a named test.
+- Documentation establishes intended behavior; test vectors, recorded API responses, reconciliation and operational drills establish observed behavior. If not independently observed, mark UNVERIFIED and prohibit that capability from live deployment.
+- Before any live MSTR order workflow, demonstrate idempotent order placement, rejected/time-out order reconciliation, partial fills, funding and fee posting, margin and liquidation monitoring, venue failures, reconnection, and emergency safe-state procedures.
+- Confirm shutdown behavior for existing positions separately from the no-new-trades gate. Never assume loss of connectivity safely closes exposure.
+- Red team, blue team and an actual independent Claude review require evidence artifacts. Reviewer agreement does not override a failed test or unknown critical exchange behavior.
