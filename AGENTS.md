@@ -45,3 +45,9 @@ Every PR must state what is verified, assumed, unverified and intentionally excl
 - Before any live MSTR order workflow, demonstrate idempotent order placement, rejected/time-out order reconciliation, partial fills, funding and fee posting, margin and liquidation monitoring, venue failures, reconnection, and emergency safe-state procedures.
 - Confirm shutdown behavior for existing positions separately from the no-new-trades gate. Never assume loss of connectivity safely closes exposure.
 - Red team, blue team and an actual independent Claude review require evidence artifacts. Reviewer agreement does not override a failed test or unknown critical exchange behavior.
+
+## Avoid analysis paralysis — minimum viable live discovery
+- Do not insist on perfect models, exhaustive history or completed advanced strategy architecture before an explicitly authorised, minuscule, supervised *mechanical* MSTR execution test. Follow G2.5 in docs/EXECUTION_PLAN.md.
+- Distinguish mechanical exchange verification from proving a trading edge. Early live results are observations; don't promote them to evidence of sustainable profitability.
+- Non-negotiable prerequisites are instrument/API availability, maximum possible loss boundary, tested reconciliation and exit/contingency behaviour, explicit user budget and approval, and critical-control red/blue/Claude review. No approval is implied by this instruction.
+- Defer optimisations, dashboards, extensive indicators and non-critical features. Build the smallest working system and improve from real, reconciled observations.
