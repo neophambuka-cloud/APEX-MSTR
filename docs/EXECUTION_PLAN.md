@@ -28,3 +28,17 @@ Blue team proves intended behaviour using reproducible acceptance tests. Indepen
 
 ## Definition of done for every gate
 Evidence/artifact, executed tests, failure behaviour, known uncertainties, decision PASS/FAIL, and precisely one recommended next operation. If FAIL, repair only failed prerequisite. No new scope by default.
+
+
+## Early micro-funded hunt — operational discovery, not a claim of proven edge
+A bounded live discovery stage G2.5 may follow G0-G2, *before* extensive historical model optimization and full G3-G5, if the exchange supports an eligible MSTR instrument with a position size below an explicitly authorised total-loss budget. This stage must not be described as production autonomy or validated profitable strategy.
+
+Minimum non-negotiable gates:
+1. Verify MSTR instrument, API access/order path, minimum order size, fees, funding if applicable, margin and liquidation/close rules, and venue trading availability with source evidence and small-scale read-only tests.
+2. Demonstrate order intent -> acknowledgment -> fills/partial fills -> fees -> position/balance reconciliation, with safe handling of ambiguous responses, duplicate events and cancelled requests; test a safe manual exit procedure and loss-of-connectivity response.
+3. User gives explicit bounded budget for **total possible loss including fees and any liabilities**, instrument, account isolation and specific live-test approval. Ensure no other assets are exposed. No withdrawals permission.
+4. First live test is manually supervised, one position at a time, minimum supported notional and the smallest permitted effective leverage, with no auto-resizing, averaging down, martingale, recurring order loop or autonomous self-modification.
+5. Observe, reconcile and record actual execution, costs, positions and exit. If exit/position state is ambiguous, halt new orders and perform verified account reconciliation. A kill switch blocks new submissions; it does not assume existing risk disappears.
+6. Red, blue and Claude review should target only the micro-hunt critical controls before this stage, not demand completion of all future architecture. No critical unresolved defect may be accepted into a funded test. Document what is deliberately untested and keep exposure bounded accordingly.
+
+After a successful **mechanical** micro-hunt, return to G3-G5 for evidence of strategy edge before any sustained or autonomous scale-up. A successful entry/exit confirms connectivity and process, NOT profitability or general safety. If feasible minimum position risks more than the user's cap, no funded trade.
